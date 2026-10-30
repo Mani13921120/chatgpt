@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys
 
 import folder_gate as gate
 
@@ -67,6 +68,22 @@ class WindowsCommandTests(unittest.TestCase):
 
     def test_cmd_copy_known_file_is_denied(self):
         self.assert_copy_blocked('cmd', 'copy /y "%FG_SOURCE%\\nested\\data.txt" "%FG_TARGET%"')
+
+    def test_cmd_copy_and_delete_stay_denied_after_guard_process_exits(self):
+        code = 'import folder_gate as g; import sys; g.engage(sys.argv[1], sys.argv[2])'
+        child = subprocess.run([sys.executable, '-c', code, str(self.root), str(self.manifest)],
+                               capture_output=True, timeout=30)
+        self.assertEqual(child.returncode, 0, (child.stdout, child.stderr))
+        self.assertFalse(gate.active(self.root))
+        copied = self.base / 'copy after exit.txt'
+        result = self.command('cmd', 'copy /y "%FG_SOURCE%\\nested\\data.txt" "%FG_TARGET%"', copied)
+        self.assertNotEqual(result.returncode, 0, (result.stdout, result.stderr))
+        if copied.is_file():
+            self.assertNotEqual(copied.read_bytes(), b'FaceGate command test payload')
+        self.command('cmd', 'rmdir /s /q "%FG_SOURCE%"', self.base / 'unused')
+        self.assertTrue(self.file.exists())
+        gate.disengage(self.root, self.manifest)
+        self.assertEqual(self.file.read_bytes(), b'FaceGate command test payload')
 
     def test_cmd_xcopy_tree_is_denied(self):
         self.assert_copy_blocked('cmd', 'xcopy "%FG_SOURCE%" "%FG_TARGET%\\" /e /i /h /y /q')

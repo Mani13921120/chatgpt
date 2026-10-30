@@ -2,6 +2,13 @@ import sys, os, sqlite3, secrets, time, hashlib, ctypes, uuid, subprocess, xml.e
 import shutil
 import traceback
 from pathlib import Path
+# A direct .py association or an older context-menu command may use the global
+# Python. Always use this installation's dependencies when its venv is present.
+if __name__ == '__main__' and os.name == 'nt' and not getattr(sys, 'frozen', False):
+    scripts = Path(__file__).resolve().parent / '.venv' / 'Scripts'
+    launcher = scripts / ('pythonw.exe' if Path(sys.executable).name.lower() == 'pythonw.exe' else 'python.exe')
+    if launcher.is_file() and Path(sys.executable).resolve().parent != scripts.resolve():
+        raise SystemExit(subprocess.call([str(launcher), str(Path(__file__).resolve()), *sys.argv[1:]]))
 if __name__ == '__main__' and os.name == 'nt':
     try:
         from explorer_integration import restore_legacy_default
@@ -40,6 +47,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPush
     QLineEdit, QVBoxLayout, QHBoxLayout, QGridLayout, QMessageBox, QFrame, QInputDialog, QFileDialog, QListWidget, QListWidgetItem, QSystemTrayIcon, QMenu, QStyle, QScrollArea, QDialog, QDialogButtonBox, QAbstractItemView, QComboBox, QFileIconProvider)
 
 APP_DIR = Path(os.getenv('LOCALAPPDATA', str(Path.home()))) / 'FaceGate'
+APP_VERSION = '0.4.0'
 APP_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = APP_DIR / 'users.db'
 MODEL_DIR = Path(__file__).resolve().parent / 'models'
@@ -180,7 +188,7 @@ class FaceTrainingWorker(QThread):
 class FaceGate(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('FaceGate | قفل برنامه‌ها و رمزگذاری پوشه‌ها')
+        self.setWindowTitle(f'FaceGate {APP_VERSION} | قفل برنامه‌ها و رمزگذاری پوشه‌ها')
         self.resize(1050, 690)
         self.setMinimumSize(820, 560)
         self.detector = None
@@ -326,7 +334,7 @@ class FaceGate(QMainWindow):
         folder_heading = QLabel('قفل پوشه و رمزگذاری محتوا')
         folder_heading.setStyleSheet('font-size:17px;font-weight:700;margin-top:8px;')
         right.addWidget(folder_heading); self._folder_mode_widgets.append(folder_heading)
-        folder_note = QLabel('خود پوشه با مجوزهای ویندوز بسته می‌شود و محتوای فایل‌ها نیز رمزگذاری می‌شود. تا وقتی FaceGate اجراست، قفل‌های اشتراک ویندوز خواندن، کپی، تغییر نام و حذف مسیرهای قفل‌شده را محدود می‌کنند. پیش از قفل، برنامه‌های باز روی پوشه را ببند. در برابر مدیر سیستم، توقف اجباری برنامه، دسترسی خام دیسک یا نسخه‌های قبلی فایل‌ها تضمین مطلق وجود ندارد. مجوزهای قبلی پس از تأیید چهره یا PIN بازگردانده می‌شوند.')
+        folder_note = QLabel('قفل روی خود پوشه، فایل‌ها و زیرپوشه‌ها ذخیره می‌شود؛ منع خواندن، کپی و حذف پس از خروج برنامه هم باقی می‌ماند. پوشهٔ خالی نیز قابل محافظت است. پیش از قفل، برنامه‌های باز روی پوشه را ببند. بازکردن با چهره/PIN دسترسی را برای استفاده برمی‌گرداند؛ پس از پایان کار قفل مجدد را بزن. اطلاعات بازیابی FaceGate را نگه دار.')
         folder_note.setWordWrap(True); folder_note.setObjectName('sub'); right.addWidget(folder_note); self._folder_mode_widgets.append(folder_note)
         self.protected_folder_list = QListWidget(); self.protected_folder_list.setMaximumHeight(150); self.protected_folder_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.protected_folder_list.setStyleSheet('QListWidget {background:#0b1424;border:1px solid #30415d;border-radius:8px;padding:4px;} QListWidget::item {padding:6px;}')
@@ -418,7 +426,7 @@ class FaceGate(QMainWindow):
             widget.setVisible(mode == 'folders')
         label = 'حالت قفل برنامه‌ها' if mode == 'apps' else 'حالت رمزگذاری فایل‌ها و پوشه‌ها'
         self.workspace_label.setText(label)
-        self.setWindowTitle('FaceGate | ' + label)
+        self.setWindowTitle(f'FaceGate {APP_VERSION} | ' + label)
 
     def _show_workspace_picker(self):
         mode = self._choose_workspace_mode()

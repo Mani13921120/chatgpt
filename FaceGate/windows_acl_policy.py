@@ -156,6 +156,17 @@ def snapshot(root, paths):
             'parent': str(parent), 'parent_identity': identity(parent), 'entries': entries}
 
 
+def preflight_parent(root):
+    root = Path(os.path.realpath(os.path.abspath(root)))
+    parent = root.parent
+    if parent == root or parent == Path(parent.anchor):
+        raise RuntimeError('برای جلوگیری از تغییر مجوز ریشهٔ درایو، پوشه باید داخل یک پوشهٔ شخصی باشد.')
+    # Check permission to install/remove the guard before decrypting, encrypting,
+    # or temporarily restoring a legacy root ACL. This call changes nothing.
+    with metadata_handle(parent, write=True) as handle:
+        information(handle)
+
+
 def locked_dacl(entry):
     original = entry['dacl']
     mask = DENY_DIRECTORY if entry['directory'] else DENY_FILE

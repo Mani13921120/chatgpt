@@ -37,6 +37,7 @@ class AuthenticationTests(unittest.TestCase):
 
     def test_failed_enforcement_probe_rolls_back_gate_and_reports_failure(self):
         with patch.object(gate, 'active', return_value=False), \
+             patch.object(gate.policy, 'preflight_parent'), \
              patch.object(gate, 'saved', return_value=None), \
              patch.object(gate, '_paths', return_value=[]), \
              patch.object(gate.policy, 'snapshot', return_value={'state': 'locking'}), \

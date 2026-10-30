@@ -26,10 +26,12 @@ def _key(root):
     return os.path.normcase(os.path.realpath(os.path.abspath(root)))
 
 
-def _api():
+def _api(root=None):
     if os.name != 'nt':
         raise RuntimeError('قفل خود پوشه فقط روی Windows و دیسک دارای ACL پشتیبانی می‌شود.')
     policy.bindings()  # Check the native dependency before changing any data.
+    if root is not None:
+        policy.preflight_parent(root)
     k = C.WinDLL('kernel32', use_last_error=True)
     a = C.WinDLL('advapi32', use_last_error=True)
     k.CreateFileW.argtypes = [W.LPCWSTR, W.DWORD, W.DWORD, C.c_void_p, W.DWORD, W.DWORD, W.HANDLE]
@@ -184,6 +186,7 @@ def _restore_existing(root, manifest, value):
 def engage(root, manifest):
     """Journal all original ACLs, apply tree/parent guards, then verify Windows."""
     root = Path(os.path.realpath(os.path.abspath(root)))
+    policy.preflight_parent(root)
     if active(root):
         verify_lock(root, manifest)
         return

@@ -22,9 +22,11 @@ def main():
     report = io.StringIO()
     result = unittest.TextTestRunner(stream=report, verbosity=2).run(suite)
     print(report.getvalue(), flush=True)
+    summary = f'Administrator token: {administrator}; tests: {result.testsRun}; failures: {len(result.failures)}; errors: {len(result.errors)}; skipped: {len(result.skipped)}'
+    if os.environ.get('GITHUB_ACTIONS'):
+        print('::notice title=Windows validation result::' + annotation(summary), flush=True)
     for test, trace in result.failures + result.errors:
         print('::error title=' + annotation(test.id()) + '::' + annotation(trace), flush=True)
-    summary = f'Administrator token: {administrator}; tests: {result.testsRun}; failures: {len(result.failures)}; errors: {len(result.errors)}; skipped: {len(result.skipped)}'
     print(summary, flush=True)
     if os.environ.get('GITHUB_STEP_SUMMARY'):
         Path(os.environ['GITHUB_STEP_SUMMARY']).write_text('# Windows folder protection\n\n' + summary + '\n\n```text\n' + report.getvalue() + '\n```\n', encoding='utf-8')

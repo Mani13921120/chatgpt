@@ -629,7 +629,7 @@ def folder_gate_active(folder):
 
 
 def protect_folder_in_place(folder, pin, metadata_root, backup_root):
-    folder_gate._api()  # fail before modifying data on unsupported platforms
+    folder_gate._api(folder)  # Check parent rights and native support before data changes.
     result = _content_protect(folder, pin, metadata_root, backup_root)
     try:
         folder_gate.engage(result['root'], result['manifest_path'])
@@ -668,7 +668,7 @@ def lock_folder_in_place(folder, metadata_root, pin=None, manifest=None):
         count = folder_gate.verify_lock(folder, mp)
         return {'root': str(folder), 'manifest_path': str(mp), 'state': 'locked',
                 'file_count': count, 'warning': ''}
-    folder_gate._api()
+    folder_gate._api(folder)
     has_gate = folder_gate.saved(folder, mp) is not None
     if has_gate:
         meta = read_manifest(mp)
