@@ -145,6 +145,11 @@ def _path_is_link(path: Path) -> bool:
         return True
 
 
+def _walk_error(exc):
+    # Inaccessible directories are errors, never an apparently empty folder.
+    raise exc
+
+
 def _cleanup_stale_temps(root: Path) -> int:
     """Remove only atomic-write temp files left by an interrupted FaceGate operation.
 
@@ -155,7 +160,7 @@ def _cleanup_stale_temps(root: Path) -> int:
     import re
     pattern = re.compile(r'^\..+\.(?:fglock-tmp|fgunlock-tmp)-[0-9a-f]{32}$', re.IGNORECASE)
     removed = 0
-    for current, dirs, files in os.walk(root, followlinks=False):
+    for current, dirs, files in os.walk(root, followlinks=False, onerror=_walk_error):
         base = Path(current)
         dirs[:] = [name for name in dirs if not _path_is_link(base / name)]
         for name in files:
@@ -187,7 +192,7 @@ def walk_regular_files(folder: str | Path) -> list[Path]:
         raise RuntimeError("مسیر انتخاب‌شده پوشهٔ معتبر و مستقیم نیست.")
     _cleanup_stale_temps(root)
     result: list[Path] = []
-    for current, dirs, files in os.walk(root, followlinks=False):
+    for current, dirs, files in os.walk(root, followlinks=False, onerror=_walk_error):
         current_path = Path(current)
         for name in list(dirs):
             p = current_path / name
@@ -205,7 +210,7 @@ def walk_regular_files(folder: str | Path) -> list[Path]:
 def list_encrypted_files(folder: str | Path) -> list[Path]:
     root = Path(folder).resolve()
     result = []
-    for current, dirs, files in os.walk(root, followlinks=False):
+    for current, dirs, files in os.walk(root, followlinks=False, onerror=_walk_error):
         current_path = Path(current)
         dirs[:] = [name for name in dirs if not _path_is_link(current_path / name)]
         for name in files:
@@ -651,6 +656,9 @@ def unlock_folder_in_place(folder, metadata_root, pin=None, manifest=None):
 
 def lock_folder_in_place(folder, metadata_root, pin=None, manifest=None):
     mp = Path(manifest) if manifest else manifest_path(folder, metadata_root)
+    meta = read_manifest(mp)
+    if meta and meta.get('state') == 'unprotected':
+        raise RuntimeError('محافظت این پوشه برداشته شده است؛ برای قفل دوباره، آن را مجدداً اضافه کن.')
     if folder_gate.active(folder):
         meta = read_manifest(mp)
         if not meta or meta.get('state') != 'locked':
@@ -672,4 +680,28 @@ def lock_folder_in_place(folder, metadata_root, pin=None, manifest=None):
             folder_gate.engage(folder, mp)
         raise
     folder_gate.engage(folder, mp)
+    return result
+
+
+def unprotect_folder_in_place(folder, metadata_root, pin, manifest=None):
+    """Authenticate, restore data/ACLs, then retire metadata; never delete a folder.
+
+    Keep the recovery vault and retired manifest. A crash before SQLite removal
+    must not let startup rediscover/re-lock a folder the user just unprotected.
+    """
+    mp = Path(manifest) if manifest else manifest_path(folder, metadata_root)
+    meta = read_manifest(mp)
+    if not meta:
+        raise RuntimeError('اطلاعات کلید پوشه پیدا نشد؛ حذف از قفل انجام نشد.')
+    unwrap_key(meta['key_envelope'], pin=pin)
+    result = unlock_folder_in_place(folder, metadata_root, pin=pin, manifest=mp)
+    if list_encrypted_files(folder):
+        raise RuntimeError('هنوز فایل رمزگذاری‌شده باقی مانده است؛ پوشه از فهرست حذف نشد.')
+    # Traversal must succeed before claiming all contents are accessible again.
+    walk_regular_files(folder)
+    write_manifest(folder, metadata_root, meta['key_envelope'], meta.get('backup_path', ''), 'unprotected')
+    # This file belongs to FaceGate metadata, not the selected folder or its files.
+    # Removing it also prevents stale ACLs being reused if the folder is added again.
+    folder_gate.sidecar(mp).unlink(missing_ok=True)
+    result['state'] = 'unprotected'
     return result

@@ -1,10 +1,31 @@
 import sys, os, sqlite3, secrets, time, hashlib, ctypes, uuid, subprocess, xml.etree.ElementTree as ET, getpass
 import shutil
 import traceback
+from pathlib import Path
+# Shell invocations for ordinary folders must remain fast and must not create data.
+# A protected path is always forwarded to the GUI that owns its Windows handles.
+if __name__ == '__main__' and '--explorer-open' in sys.argv:
+    try:
+        from explorer_router import find_protected_root
+        from explorer_integration import open_directory
+        idx = sys.argv.index('--explorer-open')
+        selected = sys.argv[idx + 1]
+        data_dir = Path(os.getenv('LOCALAPPDATA', str(Path.home()))) / 'FaceGate'
+        protected = find_protected_root(selected, data_dir / 'users.db')
+        if protected is None:
+            open_directory(selected)
+            raise SystemExit(0)
+        sys.argv = [sys.argv[0], '--folder-action', 'open-face', '--folder-path', protected, '--from-explorer']
+    except Exception as exc:
+        if os.name == 'nt':
+            ctypes.windll.user32.MessageBoxW(None, str(exc), 'FaceGate', 0x10)
+        raise SystemExit(1)
 import psutil
 import folder_inplace_crypto as inplace_crypto
+import explorer_integration
+from folder_auth import FOLDER_AUTH_SECONDS, FolderFaceAttempt
+from instance_bridge import InstanceServer, forward_request, instance_name
 from ctypes import wintypes
-from pathlib import Path
 import cv2
 import numpy as np
 from PySide6.QtCore import QTimer, Qt, QThread, Signal, QFileInfo, QSize
@@ -192,6 +213,19 @@ class FaceGate(QMainWindow):
         self._pending_app_unlock = None
         self._folder_worker = None
         self._folder_worker_callback = None
+        self._folder_unlocking_path = None
+        self._folder_face_attempt = None
+        self._folder_prompt_active = False
+        self._folder_prompt_path = None
+        self._folder_open_from_shell = False
+        self._queued_shell_requests = []
+        self._instance_request_timer = QTimer(self)
+        self._instance_request_timer.setSingleShot(True)
+        self._instance_request_timer.timeout.connect(self._drain_instance_requests)
+        self._folder_auth_timer = QTimer(self)
+        self._folder_auth_timer.setSingleShot(True)
+        self._folder_auth_timer.setTimerType(Qt.PreciseTimer)
+        self._folder_auth_timer.timeout.connect(self._folder_face_failed)
         self._workspace_mode = None
         self._startup_relock_paths = []
         self.challenge = None
@@ -303,11 +337,14 @@ class FaceGate(QMainWindow):
         folder_refresh = QPushButton('تازه‌سازی فهرست'); folder_refresh.setObjectName('secondary'); folder_refresh.clicked.connect(self.refresh_protected_folders)
         folder_lock_row.addWidget(folder_lock); folder_lock_row.addWidget(folder_refresh); right.addLayout(folder_lock_row)
         self._folder_mode_widgets.extend([folder_lock, folder_refresh])
+        folder_remove = QPushButton('حذف پوشه از قفل (بدون حذف فایل‌ها)')
+        folder_remove.setObjectName('danger'); folder_remove.clicked.connect(self.remove_selected_folder_protection)
+        right.addWidget(folder_remove); self._folder_mode_widgets.append(folder_remove)
         folder_restore = QPushButton('بازیابی پشتیبان به پوشهٔ جدید'); folder_restore.setObjectName('secondary'); folder_restore.clicked.connect(self.restore_selected_folder_backup)
         right.addWidget(folder_restore); self._folder_mode_widgets.append(folder_restore)
         folder_menu_row = QHBoxLayout()
-        folder_menu_install = QPushButton('افزودن «بازکردن با FaceGate» به راست‌کلیک'); folder_menu_install.setObjectName('secondary'); folder_menu_install.clicked.connect(self.install_folder_context_menu)
-        folder_menu_remove = QPushButton('حذف گزینه راست‌کلیک'); folder_menu_remove.setObjectName('secondary'); folder_menu_remove.clicked.connect(self.remove_folder_context_menu)
+        folder_menu_install = QPushButton('فعال‌سازی دابل‌کلیک Explorer'); folder_menu_install.setObjectName('secondary'); folder_menu_install.clicked.connect(self.install_folder_context_menu)
+        folder_menu_remove = QPushButton('بازگردانی بازکردن عادی Explorer'); folder_menu_remove.setObjectName('secondary'); folder_menu_remove.clicked.connect(self.remove_folder_context_menu)
         folder_menu_row.addWidget(folder_menu_install); folder_menu_row.addWidget(folder_menu_remove); right.addLayout(folder_menu_row)
         self._folder_mode_widgets.extend([folder_menu_install, folder_menu_remove])
         folder_recover = QPushButton('بازیابی مجوزهای نسخهٔ قدیمی FaceGate'); folder_recover.setObjectName('secondary'); folder_recover.clicked.connect(self.recover_legacy_folder_permissions)
@@ -586,7 +623,7 @@ class FaceGate(QMainWindow):
             con.close()
         for mp in root.glob('*.json'):
             meta = inplace_crypto.read_manifest(mp)
-            if not meta:
+            if not meta or meta.get('state') == 'unprotected':
                 continue
             try:
                 folder = Path(meta.get('root', '')).resolve()
@@ -594,9 +631,10 @@ class FaceGate(QMainWindow):
                     continue
                 # Do not register arbitrary unused metadata unless some ciphertext remains
                 # or the manifest explicitly says an operation was interrupted/open.
-                encrypted = inplace_crypto.list_encrypted_files(folder)
                 state = str(meta.get('state', ''))
-                if encrypted or state in {'protecting', 'unlocked', 'recovery-needed'} or (state == 'locked' and inplace_crypto.folder_gate.saved(folder, mp)):
+                has_gate = inplace_crypto.folder_gate.saved(folder, mp) is not None
+                encrypted = [] if has_gate else inplace_crypto.list_encrypted_files(folder)
+                if encrypted or state in {'protecting', 'unlocked', 'recovery-needed'} or (state == 'locked' and has_gate):
                     locked = 1 if state == 'locked' else 0
                     con = db()
                     try:
@@ -646,7 +684,9 @@ class FaceGate(QMainWindow):
                         manifest = inplace_crypto.read_manifest(metadata_path)
                 except Exception:
                     manifest = None
-            if manifest and inplace_crypto.folder_gate_active(folder):
+            if manifest and manifest.get('state') == 'unprotected':
+                status = 'محافظت برداشته شده — قابل حذف از فهرست'
+            elif manifest and inplace_crypto.folder_gate_active(folder):
                 status = 'خود پوشه قفل است — ورود، کپی و تغییر نام مسدود'
             elif manifest:
                 try:
@@ -998,11 +1038,20 @@ foreach ($entry in $rows) {
         return str(result)
 
     def choose_and_protect_folder(self):
-        selected = QFileDialog.getExistingDirectory(self, 'انتخاب پوشه برای رمزگذاری محتوا در همان مسیر', str(Path.home()))
+        # Read-only picker: even the picker's "New folder" action is disabled.
+        picker = QFileDialog(self, 'انتخاب پوشهٔ موجود برای قفل', str(Path.home()))
+        picker.setOption(QFileDialog.DontUseNativeDialog, True)
+        picker.setFileMode(QFileDialog.Directory)
+        picker.setOption(QFileDialog.ShowDirsOnly, True)
+        picker.setOption(QFileDialog.ReadOnly, True)
+        selected = picker.selectedFiles()[0] if picker.exec() == QDialog.Accepted and picker.selectedFiles() else None
         if selected:
             self.protect_folder_path(selected)
 
     def protect_folder_path(self, folder_path):
+        if self._folder_action_busy():
+            QMessageBox.information(self, 'عملیات در حال انجام است', 'ابتدا عملیات یا احراز هویت فعلی را تمام کن.')
+            return False
         try:
             folder = self._validate_folder_target(folder_path)
         except Exception as exc:
@@ -1066,51 +1115,92 @@ foreach ($entry in $rows) {
         if not self._is_modern_folder_record(record):
             QMessageBox.warning(self, 'نسخهٔ قدیمی پوشه', 'این پوشه از نسخهٔ قدیمی EFS/ACL است؛ ابتدا گزینهٔ بازیابی مجوزهای نسخهٔ قدیمی را اجرا کن.')
             return
+        self._folder_open_from_shell = False
         self._start_folder_face_auth(record)
 
+    def _folder_action_busy(self):
+        return (self._folder_worker is not None or self._folder_prompt_active
+                or self.mode in {'login', 'enroll'} or self._pending_app_unlock is not None)
+
     def _start_folder_face_auth(self, record):
+        if self._folder_action_busy():
+            self._restore_from_tray()
+            return
         if not Path(record['path']).is_dir():
-            QMessageBox.warning(self, 'پوشه پیدا نشد', f'این مسیر پیدا نشد:\n{record["path"]}')
+            QMessageBox.warning(self, 'پوشه پیدا نشد', f'پوشه موجود نیست: {record["path"]}')
             return
-        try:
-            encrypted = inplace_crypto.list_encrypted_files(record['path'])
-            plaintext = inplace_crypto.walk_regular_files(record['path'])
-        except Exception as exc:
-            QMessageBox.warning(self, 'بررسی پوشه ناموفق بود', str(exc))
+        meta = inplace_crypto.read_manifest(record['backup'])
+        if not meta:
+            QMessageBox.warning(self, 'اطلاعات پوشه در دسترس نیست', 'کلید پوشه پیدا نشد؛ هیچ قفلی برداشته نشد.')
             return
-        if encrypted and plaintext:
-            QMessageBox.warning(self, 'پوشه وضعیت ترکیبی دارد',
-                'هم فایل رمزگذاری‌شده و هم فایل خوانا در این پوشه پیدا شد. برای جلوگیری از باقی‌ماندن فایل خوانا، فعلاً بازکردن متوقف شد. ابتدا «قفل مجدد پوشه» را بزن تا فایل‌های خوانا رمزگذاری شوند.')
+        if meta.get('state') not in {'locked', 'unlocked'}:
+            QMessageBox.warning(self, 'بررسی پوشه لازم است', 'ابتدا وضعیت پوشه را بررسی و در صورت نیاز قفل مجدد کن؛ احراز هویت شروع نشد.')
             return
-        if not encrypted and not record.get('locked'):
-            try:
-                os.startfile(record['path'])
-            except Exception as exc:
-                QMessageBox.warning(self, 'Explorer اجرا نشد', str(exc))
+        # Do not enumerate a directory that our own ACL/handles intentionally block.
+        self.set_workspace_mode('folders')
+        self._restore_from_tray()
+        self._pending_app_unlock = {'kind': 'folder_unlock', 'path': record['path'],
+                                    'name': record['name'], 'backup': record['backup']}
+        self._gate_active = True
+        if self.face_template is None or self.recognizer is None:
+            self._folder_face_failed('چهره ثبت نشده یا مدل تشخیص چهره در دسترس نیست.')
             return
-        if not encrypted and record.get('locked'):
-            try:
-                plaintext = inplace_crypto.walk_regular_files(record['path'])
-            except Exception as exc:
-                QMessageBox.critical(self, 'بررسی پوشه ناموفق بود', str(exc))
-                return
-            if plaintext:
-                QMessageBox.warning(self, 'محتوا رمزگذاری‌شده نیست',
-                    'فهرست FaceGate می‌گوید این پوشه قفل است، اما فایل‌های معمولیِ رمزگذاری‌نشده پیدا شدند. برای جلوگیری از نمایش محتوای محافظت‌نشده، پوشه باز نشد. دکمهٔ «قفل مجدد پوشه» را اجرا کن و اگر خطا دیدی آن را نگه دار.')
-                return
-        if self.face_template is None or (not self.face_templates and not TEMPLATE_PATH.exists()) or self.recognizer is None:
-            QMessageBox.warning(self, 'چهره ثبت نشده', 'ابتدا در بخش مدیریت چهره، چهره‌ات را ثبت کن یا از PIN پشتیبان استفاده کن.')
-            return
-        self._pending_app_unlock = {'kind': 'folder_unlock', 'path': record['path'], 'name': record['name'], 'backup': record['backup'], 'pin': None}
         if not self.start_camera():
-            self._pending_app_unlock = None
-            QMessageBox.warning(self, 'وب‌کم در دسترس نیست', 'دوربین برای احراز هویت در دسترس نیست؛ فایل‌ها در حالت فعلی باقی ماندند.')
+            self._folder_face_failed('دوربین در دسترس نیست.')
             return
         self.login_start = time.time()
         self.login_matches = 0
         self.login_last_label = None
         self.mode = 'login'
-        self.status.setText(f'برای رمزگشایی محتویات «{record["name"]}»، چهره را روبه‌روی دوربین نگه دار…')
+        # Deadline starts when the camera is ready, not while Windows opens it.
+        self._folder_face_attempt = FolderFaceAttempt()
+        self._folder_auth_timer.start(int(FOLDER_AUTH_SECONDS * 1000))
+        self.status.setText(f'بررسی چهره برای «{record["name"]}» — حداکثر ۳ ثانیه')
+
+    def _folder_face_failed(self, reason=''):
+        pending = self._pending_app_unlock
+        if not pending or pending.get('kind') != 'folder_unlock' or self._folder_prompt_active:
+            return
+        record = {'path': pending['path'], 'name': pending['name'], 'backup': pending['backup'], 'locked': True}
+        self._pending_app_unlock = None
+        self.mode = 'idle'
+        self.login_matches = 0
+        self.login_last_label = None
+        self.stop_camera()
+        self._folder_prompt_active = True
+        self._folder_prompt_path = record['path']
+        self.status.setText('تشخیص چهره ناموفق؛ این درخواست تأیید نشد و وضعیت قبلی پوشه تغییر نکرد.')
+        box = QMessageBox(self)
+        box.setWindowTitle('تشخیص چهره ناموفق')
+        box.setText('تشخیص چهره ناموفق بود. مایل هستید مجدداً تلاش کنید یا PIN خود را وارد کنید؟')
+        if reason:
+            box.setInformativeText(str(reason))
+        retry = box.addButton('تلاش مجدد', QMessageBox.AcceptRole)
+        pin = box.addButton('ورود PIN', QMessageBox.ActionRole)
+        box.addButton('انصراف', QMessageBox.RejectRole)
+        box.setDefaultButton(retry)
+        try:
+            box.exec()
+            clicked = box.clickedButton()
+        finally:
+            self._folder_prompt_active = False
+            self._folder_prompt_path = None
+            self._gate_active = False
+        if clicked is retry:
+            QTimer.singleShot(0, lambda: self._start_folder_face_auth(record))
+        elif clicked is pin:
+            self._open_folder_with_pin(record)
+        else:
+            self._folder_open_from_shell = False
+
+    def _open_folder_in_explorer(self, path):
+        try:
+            explorer_integration.open_directory(path)
+            if self._folder_open_from_shell:
+                self.hide()
+            self._folder_open_from_shell = False
+        except Exception as exc:
+            QMessageBox.warning(self, 'Explorer اجرا نشد', str(exc))
 
     def set_folder_pin(self):
         QMessageBox.information(self, 'PIN پوشه', 'PIN هشت‌رقمی هنگام رمزگذاری هر پوشه تنظیم می‌شود. برای تغییر آن، پوشه را با PIN فعلی باز کن و دوباره محافظت کن.')
@@ -1119,20 +1209,46 @@ foreach ($entry in $rows) {
         record = self._selected_protected_folder()
         if not record:
             return
+        self._folder_open_from_shell = False
+        self._open_folder_with_pin(record)
+
+    def _open_folder_with_pin(self, record):
+        if self._folder_worker is not None or self._folder_prompt_active or self.mode == 'enroll':
+            QMessageBox.information(self, 'عملیات در حال انجام است', 'ابتدا عملیات فعلی را تمام کن.')
+            return
+        pending = self._pending_app_unlock
+        if pending:
+            if pending.get('kind') != 'folder_unlock' or pending['path'] != record['path']:
+                QMessageBox.information(self, 'احراز هویت در حال انجام است', 'ابتدا احراز هویت فعلی را تمام یا لغو کن.')
+                return
+            from_shell = self._folder_open_from_shell
+            self.cancel_action()
+            self._folder_open_from_shell = from_shell
         if not self._is_modern_folder_record(record):
             QMessageBox.warning(self, 'نسخهٔ قدیمی پوشه', 'این پوشه از نسخهٔ قدیمی EFS/ACL است؛ ابتدا گزینهٔ بازیابی مجوزهای نسخهٔ قدیمی را اجرا کن.')
             return
-        pin, ok = QInputDialog.getText(self, 'بازکردن پوشه با PIN', f'PIN هشت‌رقمی برای «{record["name"]}» را وارد کن:', QLineEdit.Password)
+        self._folder_prompt_active = True
+        self._folder_prompt_path = record['path']
+        self._gate_active = True
+        try:
+            pin, ok = QInputDialog.getText(self, 'بازکردن پوشه با PIN', f'PIN هشت‌رقمی برای «{record["name"]}» را وارد کن:', QLineEdit.Password)
+        finally:
+            self._folder_prompt_active = False
+            self._folder_prompt_path = None
+            self._gate_active = False
         if not ok:
             return
         if not pin.isdigit() or len(pin) != 8:
             QMessageBox.warning(self, 'PIN نامعتبر', 'PIN باید دقیقاً ۸ رقم باشد.')
             return
         folder = Path(record['path'])
-        self._run_folder_worker(
+        self._folder_unlocking_path = record['path']
+        started = self._run_folder_worker(
             lambda: inplace_crypto.unlock_folder_in_place(folder, self._metadata_root(), pin=pin, manifest=record['backup']),
             lambda success, result: self._on_folder_unlock_done(record, success, result),
             f'در حال تأیید PIN و رمزگشایی فایل‌های «{record["name"]}»…')
+        if not started:
+            self._folder_unlocking_path = None
 
     def _finish_folder_unlock(self, pending):
         folder = Path(pending['path'])
@@ -1143,13 +1259,17 @@ foreach ($entry in $rows) {
         if not record or not self._is_modern_folder_record(record):
             QMessageBox.warning(self, 'پوشه ثبت نشده', 'اطلاعات رمزگذاری این پوشه پیدا نشد؛ هیچ فایلی تغییر نکرد.')
             return False
-        self._run_folder_worker(
+        self._folder_unlocking_path = record['path']
+        started = self._run_folder_worker(
             lambda: inplace_crypto.unlock_folder_in_place(folder, self._metadata_root(), pin=None, manifest=record['backup']),
             lambda success, result: self._on_folder_unlock_done(record, success, result),
             f'چهره تأیید شد؛ در حال رمزگشایی «{folder.name}» در مسیر اصلی…')
-        return True
+        if not started:
+            self._folder_unlocking_path = None
+        return started
 
     def _on_folder_unlock_done(self, record, success, result):
+        self._folder_unlocking_path = None
         folder = Path(record['path'])
         if not success:
             self.status.setText('بازکردن پوشه ناموفق بود؛ داده‌ها تا حد امکان به حالت قبلی برگشت داده شدند.')
@@ -1163,11 +1283,59 @@ foreach ($entry in $rows) {
         finally:
             con.close()
         self.refresh_protected_folders()
+        self.status.setText(f'«{folder.name}» باز شد؛ بعد از پایان کار «قفل مجدد پوشه» را بزن.')
+        self._open_folder_in_explorer(folder)
+
+    def remove_selected_folder_protection(self):
+        if self._folder_action_busy():
+            QMessageBox.information(self, 'عملیات در حال انجام است', 'ابتدا عملیات یا احراز هویت فعلی را تمام کن.')
+            return
+        record = self._selected_protected_folder()
+        if not record:
+            return
+        if not self._is_modern_folder_record(record):
+            QMessageBox.warning(self, 'نسخهٔ قدیمی پوشه', 'ابتدا مجوزهای نسخهٔ قدیمی را با گزینهٔ بازیابی برگردان.')
+            return
+        self._folder_prompt_active = True
+        self._folder_prompt_path = record['path']
+        self._gate_active = True
         try:
-            os.startfile(str(folder))
-            self.status.setText(f'محتوای «{folder.name}» باز شد؛ بعد از پایان کار «قفل مجدد پوشه» را بزن.')
-        except Exception as exc:
-            QMessageBox.warning(self, 'محتوا باز شد، اما Explorer اجرا نشد', f'فایل‌ها رمزگشایی شدند؛ Explorer اجرا نشد:\n{exc}\n\n{folder}')
+            answer = QMessageBox.question(self, 'حذف از قفل',
+                f'محافظت «{record["name"]}» برداشته شود؟ فایل‌ها رمزگشایی می‌شوند و مجوزهای پوشه برمی‌گردند. خود پوشه و فایل‌هایش حذف نمی‌شوند.',
+                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+            if answer != QMessageBox.Yes:
+                return
+            pin, ok = QInputDialog.getText(self, 'تأیید حذف از قفل', 'PIN هشت‌رقمی همین پوشه را وارد کن:', QLineEdit.Password)
+        finally:
+            self._folder_prompt_active = False
+            self._folder_prompt_path = None
+            self._gate_active = False
+        if not ok:
+            return
+        if not pin.isdigit() or len(pin) != 8:
+            QMessageBox.warning(self, 'PIN نامعتبر', 'PIN باید دقیقاً ۸ رقم باشد.')
+            return
+
+        def remove_protection():
+            result = inplace_crypto.unprotect_folder_in_place(record['path'], self._metadata_root(), pin, manifest=record['backup'])
+            # SQLite is touched only after decryption, ACL restoration and retirement.
+            con = db()
+            try:
+                con.execute('DELETE FROM protected_folders WHERE path=?', (record['path'],))
+                con.commit()
+            finally:
+                con.close()
+            return result
+
+        def complete(success, result):
+            self.refresh_protected_folders()
+            if not success:
+                QMessageBox.critical(self, 'حذف از قفل کامل نشد', self._folder_error_text(result) + '\nپوشه را حذف نکن؛ اطلاعات بازیابی حفظ شده‌اند.')
+                return
+            self.status.setText(f'«{record["name"]}» از فهرست قفل حذف شد؛ پوشه و فایل‌هایش باقی ماندند.')
+            QMessageBox.information(self, 'حذف از قفل انجام شد', 'پوشه به حالت عادی برگشت و دیگر به‌طور خودکار قفل نمی‌شود. فایل‌ها و پشتیبان بازیابی حذف نشده‌اند.')
+
+        self._run_folder_worker(remove_protection, complete, f'در حال بررسی PIN و برداشتن محافظت «{record["name"]}»…')
 
     def lock_selected_folder(self):
         record = self._selected_protected_folder()
@@ -1329,7 +1497,7 @@ foreach ($entry in $rows) {
         seen = set()
         for folder_path, metadata_path, is_locked in rows:
             manifest = inplace_crypto.read_manifest(metadata_path) if metadata_path else None
-            if not manifest:
+            if not manifest or manifest.get('state') == 'unprotected':
                 continue
             if inplace_crypto.folder_gate_active(folder_path):
                 continue
@@ -1391,7 +1559,7 @@ foreach ($entry in $rows) {
             con.close()
         for path, metadata_path, is_locked in rows:
             manifest = inplace_crypto.read_manifest(metadata_path) if metadata_path else None
-            if not manifest:
+            if not manifest or manifest.get('state') == 'unprotected':
                 # Legacy EFS/ACL records require their existing explicit recovery flow.
                 continue
             try:
@@ -1454,47 +1622,72 @@ foreach ($entry in $rows) {
         script_path = str(Path(__file__).resolve())
         if getattr(sys, 'frozen', False):
             executable = str(Path(sys.executable).resolve())
-            return f'"{executable}" --folder-action open-face --folder-path "%1"'
+            return f'"{executable}" --explorer-open "%1"'
         py = Path(sys.executable).resolve()
         pythonw = py.with_name('pythonw.exe')
         executable = pythonw if pythonw.exists() else py
-        return f'"{executable}" "{script_path}" --folder-action open-face --folder-path "%1"'
+        return f'"{executable}" "{script_path}" --explorer-open "%1"'
 
     def install_folder_context_menu(self):
         if os.name != 'nt':
             QMessageBox.warning(self, 'فقط ویندوز', 'این گزینه فقط در Windows Explorer قابل نصب است.')
             return
+        answer = QMessageBox.question(self, 'اتصال دابل‌کلیک Explorer',
+            'فرمان پیش‌فرض بازکردن پوشه‌ها برای همین حساب به FaceGate متصل شود؟ پوشه‌های ثبت‌نشده عادی باز می‌شوند؛ پوشهٔ قفل‌شده بررسی چهرهٔ ۳ ثانیه‌ای دارد. تنظیم قبلی برای بازگردانی ذخیره می‌شود.\n\n'
+            'این اتصال فرمان Open و دابل‌کلیک را پوشش می‌دهد؛ نوار آدرس، کپی، تغییر نام و دسترسی مستقیم فایل‌ها الزاماً این فرمان را اجرا نمی‌کنند. تا پیش از بازگردانی اتصال، فایل برنامه را جابه‌جا یا حذف نکن.',
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+        if answer != QMessageBox.Yes:
+            return
         try:
-            import winreg
-            key_path = r'Software\Classes\Directory\shell\FaceGateOpen'
-            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
-                winreg.SetValueEx(key, None, 0, winreg.REG_SZ, 'بازکردن پوشه با FaceGate')
-                exe_for_icon = str(Path(sys.executable if getattr(sys, 'frozen', False) else sys.executable).resolve())
-                winreg.SetValueEx(key, 'Icon', 0, winreg.REG_SZ, exe_for_icon)
-            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key_path + r'\command', 0, winreg.KEY_SET_VALUE) as key:
-                winreg.SetValueEx(key, None, 0, winreg.REG_SZ, self._folder_context_menu_command())
-            QMessageBox.information(self, 'منوی Explorer اضافه شد',
-                'از این پس با راست‌کلیک روی پوشه، گزینه «بازکردن پوشه با FaceGate» ظاهر می‌شود. این گزینه به‌جای بازکردن مستقیم، FaceGate را اجرا می‌کند؛ پس از تأیید چهره، پوشهٔ ثبت‌شده باز می‌شود. دوبارکلیک معمولی قابل جایگزینی نیست؛ وقتی پوشه قفل است، دسترسی مستقیم باید رد شود.')
+            explorer_integration.install(self._folder_context_menu_command(), str(Path(sys.executable).resolve()))
+            QMessageBox.information(self, 'اتصال Explorer فعال شد',
+                'دابل‌کلیک یا فرمان بازکردن استاندارد Explorer اکنون از FaceGate عبور می‌کند. اگر پنجرهٔ Explorer قدیمی تغییر را نگرفت، آن را ببند و دوباره باز کن. دوربین فقط برای پوشهٔ ثبت‌شده و قفل‌شده فعال می‌شود.')
         except Exception as exc:
-            QMessageBox.warning(self, 'ثبت منوی Explorer ناموفق', str(exc))
+            QMessageBox.warning(self, 'ثبت اتصال Explorer ناموفق', str(exc))
 
     def remove_folder_context_menu(self):
         if os.name != 'nt':
             return
         try:
-            import winreg
-            key_path = r'Software\Classes\Directory\shell\FaceGateOpen'
-            try:
-                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, key_path + r'\command')
-            except FileNotFoundError:
-                pass
-            try:
-                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, key_path)
-            except FileNotFoundError:
-                pass
-            QMessageBox.information(self, 'منوی Explorer حذف شد', 'گزینه راست‌کلیک FaceGate حذف شد. پوشه‌های رمزگذاری‌شده و مجوزهای آن‌ها تغییری نکردند.')
+            explorer_integration.uninstall()
+            QMessageBox.information(self, 'بازکردن عادی Explorer برگشت', 'تنظیم قبلی بازگردانده شد. فایل‌ها و قفل پوشه‌ها تغییری نکردند.')
         except Exception as exc:
-            QMessageBox.warning(self, 'حذف منوی Explorer ناموفق', str(exc))
+            QMessageBox.warning(self, 'بازگردانی Explorer ناموفق', str(exc))
+
+    def _handle_instance_request(self, request):
+        action = request['action']
+        if action == 'show':
+            self._restore_from_tray()
+            return
+        path = request['path']
+        if self._folder_worker is not None and str(self._folder_unlocking_path).casefold() == str(path).casefold():
+            self._restore_from_tray()
+            return
+        if self._folder_prompt_active and str(self._folder_prompt_path).casefold() == str(path).casefold():
+            self._restore_from_tray()
+            return
+        pending = self._pending_app_unlock
+        if (pending and pending.get('kind') == 'folder_unlock'
+                and str(pending['path']).casefold() == str(path).casefold()):
+            self._restore_from_tray()
+            return  # Repeated double-clicks must not extend the three-second deadline.
+        if self._folder_action_busy() or self._startup_relock_paths:
+            if request not in self._queued_shell_requests and len(self._queued_shell_requests) < 8:
+                self._queued_shell_requests.append(request)
+            self._instance_request_timer.start(300)
+            return
+        self.set_workspace_mode('folders')
+        self._restore_from_tray()
+        if action in {'protect', 'lock'} and not self._require_management_password('تأیید عملیات پوشه'):
+            return
+        self._folder_open_from_shell = action in {'open-face', 'open-pin'}
+        self._dispatch_folder_cli_action(action, path)
+
+    def _drain_instance_requests(self):
+        if self._queued_shell_requests:
+            self._handle_instance_request(self._queued_shell_requests.pop(0))
+        if self._queued_shell_requests:
+            self._instance_request_timer.start(300)
 
     def _dispatch_folder_cli_action(self, action, folder_path):
         if not folder_path or action not in {'protect', 'open-face', 'open-pin', 'lock'}:
@@ -1506,13 +1699,17 @@ foreach ($entry in $rows) {
         else:
             record = self._folder_record(folder_path)
             if not record:
-                QMessageBox.warning(self, 'پوشه ثبت نشده', 'این پوشه هنوز محافظت نشده است؛ ابتدا پوشه را ثبت و رمزگذاری کن.')
+                # A queued request may arrive just after the user removed protection.
+                if self._folder_open_from_shell and Path(folder_path).is_dir():
+                    self._open_folder_in_explorer(folder_path)
+                else:
+                    QMessageBox.warning(self, 'پوشه ثبت نشده', 'این پوشه در فهرست قفل نیست.')
                 return
             self.protected_folder_list.setCurrentRow(next((i for i in range(self.protected_folder_list.count()) if str(self.protected_folder_list.item(i).data(Qt.UserRole)).casefold() == str(folder_path).casefold()), -1))
             if action == 'open-face':
                 self._start_folder_face_auth(record)
             else:
-                self.open_selected_folder_with_pin()
+                self._open_folder_with_pin(record)
 
     def _startup_command(self):
         """Build a quoted command for the current EXE or Python script."""
@@ -1636,6 +1833,11 @@ foreach ($entry in $rows) {
         QMessageBox.information(self, 'رمز پشتیبان', 'رمز پشتیبان ذخیره شد. آن را در جای امن نگه دار.')
 
     def use_backup_password(self):
+        pending = self._pending_app_unlock
+        if pending and pending.get('kind') == 'folder_unlock':
+            self._open_folder_with_pin({'path': pending['path'], 'name': pending['name'],
+                                        'backup': pending['backup'], 'locked': True})
+            return
         con = db()
         row = con.execute('SELECT value FROM app_settings WHERE key=?', ('backup_password_hash',)).fetchone()
         con.close()
@@ -1919,7 +2121,7 @@ foreach ($entry in $rows) {
 
     def check_locked_foreground_app(self):
         """Best-effort gate for new processes and foreground re-activations."""
-        if self._gate_active:
+        if self._gate_active or self._folder_worker is not None or self._folder_prompt_active:
             return
         con = db()
         rows = con.execute('SELECT path, display_name FROM locked_apps WHERE enabled=1').fetchall()
@@ -2082,6 +2284,8 @@ foreach ($entry in $rows) {
 
     def stop_camera(self):
         """Stop frame processing and release the webcam immediately."""
+        self._folder_auth_timer.stop()
+        self._folder_face_attempt = None
         try:
             self.timer.stop()
         except Exception:
@@ -2140,6 +2344,9 @@ foreach ($entry in $rows) {
 
     def update_frame(self):
         if not self.cap or not self.cap.isOpened(): return
+        if self._folder_face_attempt is not None and self._folder_face_attempt.expired():
+            self._folder_face_failed()
+            return
         ok, frame = self.cap.read()
         if not ok: return
         frame = cv2.flip(frame, 1)
@@ -2164,8 +2371,12 @@ foreach ($entry in $rows) {
             elif self.mode == 'login':
                 self.check_liveness(frame, face)
         else:
+            if self._folder_face_attempt is not None:
+                self._folder_face_attempt.no_face()
             if self.mode in ('enroll','login'):
                 self.status.setText('صورت را در محدوده دوربین نگه دارید؛ نور مستقیم و شدید پشت سر نباشد.')
+        if self.cap is None:
+            return  # Do not display an old camera frame after success/failure/cancel.
         if self.mode == 'login' and time.time() - self.login_start > 8.0:
             pending = self._pending_app_unlock
             self.mode = 'idle'
@@ -2231,6 +2442,13 @@ foreach ($entry in $rows) {
         QMessageBox.critical(self, 'خطا در ثبت چهره', message)
 
     def begin_login(self):
+        pending = self._pending_app_unlock
+        if pending and pending.get('kind') == 'folder_unlock':
+            record = {'path': pending['path'], 'name': pending['name'],
+                      'backup': pending['backup'], 'locked': True}
+            self.cancel_action()
+            self._start_folder_face_auth(record)
+            return
         if self.face_template is None or (not self.face_templates and not TEMPLATE_PATH.exists()) or self.recognizer is None:
             QMessageBox.warning(self, 'چهره ثبت نشده', 'ابتدا دکمه «ثبت یا بازثبت چهره من» را بزنید.')
             return
@@ -2244,6 +2462,31 @@ foreach ($entry in $rows) {
         self.status.setText('چهره را روبه‌روی دوربین نگه دارید؛ برای نتیجه بهتر نور یکنواخت و تصویر واضح داشته باشید.')
 
     def check_liveness(self, frame, face):
+        pending = self._pending_app_unlock
+        if pending and pending.get('kind') == 'folder_unlock':
+            attempt = self._folder_face_attempt
+            if attempt is None or self.mode != 'login':
+                return
+            if attempt.expired():
+                self._folder_face_failed()
+                return
+            try:
+                feature = normalize_embedding(face[4])
+                templates = list(self.face_templates.values()) or [self.face_template]
+                similarity = max(float(np.dot(feature, normalize_embedding(template))) for template in templates)
+                if attempt.observe(similarity, COSINE_THRESHOLD):
+                    self._pending_app_unlock = None
+                    self.mode = 'idle'
+                    self._gate_active = False
+                    self.stop_camera()
+                    self._finish_folder_unlock(pending)
+                elif attempt.expired():
+                    self._folder_face_failed()
+                else:
+                    self.status.setText(f'بررسی چهره تا ۳ ثانیه — تطبیق {attempt.matches}/5')
+            except Exception as exc:
+                self._folder_face_failed(str(exc))
+            return
         if time.time() - self.login_start > 8.0:
             pending = self._pending_app_unlock
             self.mode = 'idle'
@@ -2298,9 +2541,11 @@ foreach ($entry in $rows) {
         pending = self._pending_app_unlock
         self._pending_app_unlock = None
         self.mode='idle'; self.faces=[]; self.login_matches=0
+        self._gate_active = False
+        self._folder_open_from_shell = False
         self.stop_camera()
         if pending and pending.get('kind') == 'folder_unlock':
-            self.status.setText(f'عملیات لغو شد؛ پوشه «{pending["name"]}» قفل ماند.')
+            self.status.setText(f'عملیات لغو شد؛ وضعیت قبلی پوشهٔ «{pending["name"]}» تغییر نکرد.')
         elif pending:
             self.status.setText(f'عملیات لغو شد؛ «{pending["name"]}» قفل ماند. برای رمز پشتیبان از دکمه مربوطه استفاده کنید.')
         else:
@@ -2310,6 +2555,8 @@ foreach ($entry in $rows) {
         # Closing the window hides it to the tray so the monitor keeps running.
         # This is not a security boundary: terminating the process still stops monitoring.
         if self.tray is not None and not self._allow_real_exit:
+            if self._pending_app_unlock is not None or self.mode in {'login', 'enroll'}:
+                self.cancel_action()
             self.hide()
             self.tray.showMessage('FaceGate در پس‌زمینه فعال است', 'پایش برنامه‌ها ادامه دارد تا وقتی FaceGate در حال اجرا باشد.', QSystemTrayIcon.Information, 3500)
             event.ignore()
@@ -2409,6 +2656,18 @@ def main():
     app.setStyle('Fusion')
     action = _command_line_value('--folder-action')
     folder_path = _command_line_value('--folder-path')
+    request = {'action': action, 'path': folder_path} if action and folder_path else {'action': 'show', 'path': ''}
+    name = instance_name(APP_DIR.resolve())
+    try:
+        if forward_request(name, request):
+            return
+        instance = InstanceServer(name, app)
+    except (RuntimeError, ValueError) as exc:
+        QMessageBox.warning(None, 'FaceGate', str(exc))
+        return
+    # Keep requests received during startup dialogs until the primary GUI is ready.
+    queued = []
+    instance.request_received.connect(queued.append)
     folder_auth_action = action in {'open-face', 'open-pin'} and bool(folder_path)
     is_autostart = '--autostart' in sys.argv[1:]
     if action and folder_path:
@@ -2418,16 +2677,26 @@ def main():
     else:
         mode = _choose_initial_workspace_mode()
     if mode == 'exit' or mode is None:
+        instance.server.close()
         return
-    # Choosing a workspace is not authentication. Normal manual startup still authenticates.
     if not is_autostart and not folder_auth_action and not authenticate_startup(app):
+        instance.server.close()
         return
     win = FaceGate()
     win.set_workspace_mode(mode)
-    win.show()
-    QTimer.singleShot(250, win.start_startup_recovery)
+    # Keep Python ownership for the entire application lifetime.
+    win._instance = instance
+    instance.request_received.disconnect(queued.append)
+    instance.request_received.connect(win._handle_instance_request)
+    if is_autostart and win.tray is not None:
+        win.hide()
+    else:
+        win.show()
+    QTimer.singleShot(0, win.start_startup_recovery)
     if action and folder_path:
-        QTimer.singleShot(1000, lambda: win._dispatch_folder_cli_action(action, folder_path))
+        queued.insert(0, request)
+    for pending in queued:
+        QTimer.singleShot(0, lambda pending=pending: win._handle_instance_request(pending))
     sys.exit(app.exec())
 
 if __name__ == '__main__': main()

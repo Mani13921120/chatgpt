@@ -13,6 +13,44 @@ import folder_inplace_crypto as crypto
 
 
 class AuthenticationTests(unittest.TestCase):
+    def test_unprotect_restores_contents_and_retires_manifest_without_deleting_backup(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            root = base / 'selected'; root.mkdir()
+            (root / 'nested').mkdir()
+            data = os.urandom(8192)
+            file = root / 'nested' / 'data.bin'; file.write_bytes(data)
+            backup = base / 'recovery.fgvault'; backup.write_bytes(b'keep recovery data')
+            metadata = base / 'metadata'
+            key = b'k' * 32
+            envelope = {'test': True}
+            mp = crypto.write_manifest(root, metadata, envelope, backup, 'locked')
+            crypto.encrypt_file_in_place(file, key, envelope)
+            with patch.object(crypto, 'unwrap_key', return_value=key):
+                result = crypto.unprotect_folder_in_place(root, metadata, '12345678', manifest=mp)
+            self.assertEqual(result['state'], 'unprotected')
+            self.assertEqual(file.read_bytes(), data)
+            self.assertEqual(crypto.read_manifest(mp)['state'], 'unprotected')
+            self.assertEqual(backup.read_bytes(), b'keep recovery data')
+            self.assertEqual(sorted(p.relative_to(root).as_posix() for p in root.rglob('*')), ['nested', 'nested/data.bin'])
+
+    def test_unprotect_wrong_pin_leaves_everything_untouched(self):
+        with patch.object(crypto, 'read_manifest', return_value={'key_envelope': {}}), \
+             patch.object(crypto, 'unwrap_key', side_effect=RuntimeError('wrong PIN')), \
+             patch.object(crypto, 'unlock_folder_in_place') as unlock, \
+             patch.object(crypto, 'write_manifest') as write:
+            with self.assertRaisesRegex(RuntimeError, 'wrong PIN'):
+                crypto.unprotect_folder_in_place('folder', 'metadata', '87654321')
+            unlock.assert_not_called()
+            write.assert_not_called()
+
+    def test_retired_folder_cannot_be_silently_relocked(self):
+        with patch.object(crypto, 'read_manifest', return_value={'state': 'unprotected'}), \
+             patch.object(crypto, '_content_lock') as lock:
+            with self.assertRaises(RuntimeError):
+                crypto.lock_folder_in_place('folder', 'metadata')
+            lock.assert_not_called()
+
     def test_wrong_pin_never_changes_acl_or_handles(self):
         with patch.object(gate, 'saved', return_value={'original_dacl': 'D:'}), \
              patch.object(crypto, 'read_manifest', return_value={'key_envelope': {}}), \
@@ -120,6 +158,19 @@ class WindowsIntegrationTests(unittest.TestCase):
         self.assertFalse(gate.active(self.root))
         self.assertEqual(gate._get_dacl(self.root), self.original)
         self.assertEqual((self.root / 'nested' / 'data.txt').read_text(), 'original data')
+
+    def test_unprotect_removes_real_windows_gate_and_preserves_files(self):
+        metadata = self.base / 'metadata'
+        result = crypto.protect_folder_in_place(self.root, '12345678', metadata, self.base / 'backups')
+        self.mp = Path(result['manifest_path'])
+        backup = Path(result['backup_path'])
+        crypto.unprotect_folder_in_place(self.root, metadata, '12345678', manifest=self.mp)
+        self.assertFalse(gate.active(self.root))
+        self.assertFalse(gate.sidecar(self.mp).exists())
+        self.assertEqual(gate._get_dacl(self.root), self.original)
+        self.assertEqual((self.root / 'nested' / 'data.txt').read_text(), 'original data')
+        self.assertTrue(backup.is_file())
+        self.assertEqual(crypto.read_manifest(self.mp)['state'], 'unprotected')
 
     def test_persistent_dacl_survives_process_exit_and_can_be_recovered(self):
         code = 'import folder_gate as g; import sys; g.engage(sys.argv[1],sys.argv[2])'
