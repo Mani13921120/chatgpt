@@ -294,8 +294,27 @@ class SingleInstanceTests(unittest.TestCase):
 
     def test_shell_request_reaches_existing_handle_owner(self):
         request = {'action': 'open-face', 'path': 'C:\\Private Folder'}
-        self.assertTrue(forward_request(self.name, request))
-        QTest.qWait(50)
+        # Windows named-pipe delivery needs the receiving event loop to run.
+        # Exercise the actual Explorer arrangement: a separate sender process,
+        # rather than blocking the same thread that must accept the request.
+        import json
+        code = '''
+import json,sys
+from PySide6.QtCore import QCoreApplication
+from instance_bridge import forward_request
+app=QCoreApplication([])
+raise SystemExit(0 if forward_request(sys.argv[1],json.loads(sys.argv[2])) else 2)
+'''
+        sender = subprocess.Popen([sys.executable, '-c', code, self.name, json.dumps(request)],
+                                  cwd=str(Path(__file__).resolve().parent), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        deadline = __import__('time').monotonic() + 8
+        while sender.poll() is None and __import__('time').monotonic() < deadline:
+            QTest.qWait(20)
+        if sender.poll() is None:
+            sender.kill()
+        out, error = sender.communicate(timeout=5)
+        self.assertEqual(sender.returncode, 0, error.decode(errors='replace'))
+        QTest.qWait(30)
         self.assertEqual(self.requests, [request])
 
     def test_requests_cannot_grant_unlock_or_execute_commands(self):
