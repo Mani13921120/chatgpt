@@ -1,0 +1,30 @@
+"""Windows CI entry point; reports real test failures as check annotations."""
+import io
+import os
+from pathlib import Path
+import sys
+import unittest
+
+
+def annotation(value):
+    return value.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+
+
+def main():
+    if os.name != 'nt':
+        raise SystemExit('Windows validation requires real Windows, not mocks.')
+    suite = unittest.defaultTestLoader.loadTestsFromNames(['test_folder_gate', 'test_windows_commands'])
+    report = io.StringIO()
+    result = unittest.TextTestRunner(stream=report, verbosity=2).run(suite)
+    print(report.getvalue(), flush=True)
+    for test, trace in result.failures + result.errors:
+        print('::error title=' + annotation(test.id()) + '::' + annotation(trace), flush=True)
+    summary = f'Tests: {result.testsRun}; failures: {len(result.failures)}; errors: {len(result.errors)}; skipped: {len(result.skipped)}'
+    print(summary, flush=True)
+    if os.environ.get('GITHUB_STEP_SUMMARY'):
+        Path(os.environ['GITHUB_STEP_SUMMARY']).write_text('# Windows folder protection\n\n' + summary + '\n\n```text\n' + report.getvalue() + '\n```\n', encoding='utf-8')
+    raise SystemExit(0 if result.wasSuccessful() and result.testsRun and not result.skipped else 1)
+
+
+if __name__ == '__main__':
+    main()
