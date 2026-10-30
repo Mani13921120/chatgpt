@@ -37,3 +37,17 @@ jobs:
       - run: python -m pip install psutil PySide6-Essentials
       - name: Compare catalog with the actual Windows Start entries
         run: python -u run_app_validation.py
+  windows-ui:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: FaceGate
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: python -m pip install psutil PySide6-Essentials opencv-contrib-python-headless cryptography pywin32
+      - name: Test authentication queues and Explorer settings in Qt
+        run: python -u run_ui_validation.py

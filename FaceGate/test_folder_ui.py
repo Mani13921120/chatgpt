@@ -37,6 +37,8 @@ class FolderUiTests(unittest.TestCase):
         self.patches = [patch.object(self.main, 'APP_DIR', data),
                         patch.object(self.main, 'DB_PATH', data / 'users.db'),
                         patch.object(self.main.FaceGate, 'load_model'),
+                        patch.object(self.main.FaceGate, '_update_guardian'),
+                        patch.object(self.main.FaceGate, '_clear_gui_state'),
                         patch.object(self.main.FaceGate, '_setup_tray', self._no_tray)]
         for p in self.patches:
             p.start()
@@ -236,6 +238,46 @@ class FolderUiTests(unittest.TestCase):
         self.assertEqual((self.root / 'sample.txt').read_text(), 'original')
         self.win.refresh_protected_folders()
         self.assertEqual(self.win.protected_folder_list.count(), 0)
+
+    def test_app_camera_failure_preserves_pending_request_for_backup_password(self):
+        app = self.main.app_catalog.App.desktop(str(self.root / 'selected.exe'))
+        self.win._app_targets = {app.key: app}
+        pending = {'key': app.key, 'name': app.name, 'pid': 123, 'hwnd': 0, 'command': [app.executable]}
+        with patch.object(self.win, 'start_camera', return_value=False):
+            self.win._begin_app_gate_request(pending)
+        self.assertIs(self.win._pending_app_unlock, pending)
+        self.assertFalse(self.win._app_sessions.allows([app.key]))
+
+    def test_failed_app_launch_revokes_authentication_and_stops_camera(self):
+        app = self.main.app_catalog.App.desktop(str(self.root / 'selected.exe'))
+        self.win._app_targets = {app.key: app}
+        pending = {'key': app.key, 'name': app.name, 'pid': 123, 'hwnd': 0, 'command': [app.executable]}
+        self.win._pending_app_unlock = pending
+        with patch.object(self.win, '_publish_gui_state'), \
+             patch.object(self.main.app_runtime, 'launch', side_effect=OSError('missing executable')):
+            self.win._launch_pending_app(pending)
+        self.assertFalse(self.win._app_sessions.allows([app.key]))
+        self.assertIsNone(self.win._pending_app_unlock)
+        self.assertIsNone(self.win.cap)
+
+    def test_app_request_during_folder_auth_stays_queued(self):
+        app = self.main.app_catalog.App.desktop(str(self.root / 'selected.exe'))
+        self.win._app_targets = {app.key: app}
+        request = {'key': app.key, 'name': app.name, 'pid': 123, 'hwnd': 0, 'command': [app.executable]}
+        folder = {'kind': 'folder_unlock', 'path': str(self.root), 'name': 'selected'}
+        self.win._pending_app_unlock = folder
+        self.win.mode = 'login'
+        with patch.object(self.win._app_monitor, 'scan', return_value=([request], [])):
+            self.win._scan_app_processes()
+        self.assertIs(self.win._pending_app_unlock, folder)
+        self.assertEqual(list(self.win._app_gate_queue), [request])
+
+    def test_ending_guardian_requires_management_authentication(self):
+        with patch.object(self.main.os, 'name', 'nt'), \
+             patch.object(self.win, '_require_management_password', return_value=False), \
+             patch.object(self.main.guardian_state, 'set_enabled') as change:
+            self.win.toggle_guardian()
+        change.assert_not_called()
 
 
 class SingleInstanceTests(unittest.TestCase):

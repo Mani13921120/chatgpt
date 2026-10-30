@@ -113,6 +113,7 @@ class ExplorerRoutingTests(unittest.TestCase):
             self.assertEqual(find_protected_root(r'c:\PRIVATE folder\nested', db), r'C:\Private Folder')
             self.assertIsNone(find_protected_root(r'C:\Private Folder Copy', db))
             self.assertIsNone(find_protected_root(r'D:\Private Folder', db))
+            con.close()
 
 
 class FolderDeadlineTests(unittest.TestCase):

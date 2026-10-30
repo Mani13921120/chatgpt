@@ -100,6 +100,7 @@ time.sleep(90)
             with sqlite3.connect(directory / 'users.db') as con:
                 con.execute('CREATE TABLE locked_apps(path TEXT PRIMARY KEY COLLATE NOCASE,display_name TEXT,enabled INTEGER)')
                 save_app(con, app)
+            con.close()
             parent = subprocess.Popen([sys.executable, str(script)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             child = None; guard_pid = None; wake_pid = None
             try:
