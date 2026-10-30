@@ -11,6 +11,8 @@ def annotation(value):
 
 
 def main():
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='backslashreplace')
     if os.name != 'nt':
         raise SystemExit('Windows validation requires real Windows, not mocks.')
     suite = unittest.defaultTestLoader.loadTestsFromNames(['test_folder_gate', 'test_windows_commands'])
