@@ -6,13 +6,47 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import folder_gate as gate
 import folder_inplace_crypto as crypto
 
 
 class AuthenticationTests(unittest.TestCase):
+    def test_lock_handles_request_real_read_access_for_sharing_enforcement(self):
+        kernel = Mock()
+        kernel.CreateFileW.return_value = 42
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(gate, '_api', return_value=(kernel, None)), \
+                 patch.object(gate, '_paths', return_value=[Path(d)]):
+                try:
+                    gate.acquire(d)
+                    args = kernel.CreateFileW.call_args.args
+                    self.assertEqual(args[1], gate.FILE_READ_DATA)
+                    self.assertEqual(args[2], 0)
+                finally:
+                    gate.release(d)
+
+    def test_successful_read_probe_rejects_lock_without_deleting_anything(self):
+        kernel = Mock()
+        kernel.CreateFileW.return_value = 42
+        with patch.object(gate, '_api', return_value=(kernel, None)):
+            with self.assertRaises(RuntimeError):
+                gate.verify_exclusion('folder')
+        kernel.CloseHandle.assert_called_once_with(42)
+
+    def test_failed_enforcement_probe_rolls_back_gate_and_reports_failure(self):
+        original = 'D:(A;;FA;;;WD)'
+        with patch.object(gate, 'active', return_value=False), \
+             patch.object(gate, 'saved', return_value={'original_dacl': original}), \
+             patch.object(gate, '_set_dacl') as acl, \
+             patch.object(gate, 'acquire'), patch.object(gate, 'release') as release, \
+             patch.object(gate, 'verify_exclusion', side_effect=RuntimeError('not blocked')):
+            with self.assertRaisesRegex(RuntimeError, 'not blocked'):
+                gate.engage('folder', 'metadata')
+        release.assert_called_once_with('folder')
+        self.assertEqual(acl.call_args.args, ('folder', original))
+
     def test_empty_folder_and_empty_subdirectories_support_full_lifecycle(self):
         import vault_crypto
         for nested in (False, True):

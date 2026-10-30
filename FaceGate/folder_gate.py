@@ -12,6 +12,9 @@ import uuid
 
 _handles = {}
 DACL = 4
+FILE_READ_DATA = 0x0001  # FILE_LIST_DIRECTORY for directory handles
+DELETE = 0x00010000
+FILE_SHARE_ALL = 0x0007
 
 
 def _key(root):
@@ -111,9 +114,10 @@ def acquire(root):
     handles = []
     try:
         for path in _paths(root):
-            # READ_CONTROL does not grant data access. share=0 denies future data
-            # read/write/delete opens, including rename via the parent's rights.
-            h = k.CreateFileW(str(path), 0x20000, 0, None, 3, 0x02000000, None)
+            # A metadata-only READ_CONTROL handle does not participate in normal
+            # data-access sharing checks. Request actual read/list access so that
+            # share=0 enforces read/write/delete exclusion, including empty dirs.
+            h = k.CreateFileW(str(path), FILE_READ_DATA, 0, None, 3, 0x02000000, None)
             if h == C.c_void_p(-1).value:
                 raise C.WinError(C.get_last_error())
             handles.append(h)
@@ -122,6 +126,23 @@ def acquire(root):
         for h in reversed(handles):
             k.CloseHandle(h)
         raise
+
+
+def verify_exclusion(root):
+    """Never report a lock if Windows still grants read/list or delete access.
+
+    Probes request handles only; they never read, copy, rename or delete data.
+    DELETE checks the parent-permission route too, unlike inspecting the root ACL.
+    """
+    k, _ = _api()
+    for access in (FILE_READ_DATA, DELETE):
+        h = k.CreateFileW(str(root), access, FILE_SHARE_ALL, None, 3, 0x02000000, None)
+        if h != C.c_void_p(-1).value:
+            k.CloseHandle(h)
+            raise RuntimeError('ویندوز هنوز دسترسی خواندن یا حذف پوشه را می‌دهد؛ قفل کامل اعمال نشد.')
+        error = C.get_last_error()
+        if error not in (5, 32):  # ACCESS_DENIED or SHARING_VIOLATION, not missing path/etc.
+            raise C.WinError(error)
 
 
 def release(root):
@@ -163,6 +184,7 @@ def engage(root, manifest):
         # No inheritance: only the selected directory DACL changes. Preserve
         # READ_CONTROL/WRITE_DAC for restoration by its owner.
         _set_dacl(root, original[:i] + '(D;;0x00010047;;;WD)' + original[i:])
+        verify_exclusion(root)
     except Exception:
         release(root)
         _set_dacl(root, value['original_dacl'])
