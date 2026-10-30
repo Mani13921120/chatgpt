@@ -1,4 +1,4 @@
-"""Reversible per-user Explorer default verb for filesystem directories.
+"""Per-user Explorer context menu and repair of the legacy default override.
 
 This routes Shell open invocations, not arbitrary filesystem I/O. No test folders,
 shortcuts, desktop.ini files, or changes inside selected directories are created.
@@ -48,37 +48,38 @@ def _delete_key(reg, path):
         pass
 
 
+def restore_legacy_default(registry=None):
+    reg = registry or _registry()
+    current = _read(reg, SHELL_KEY)
+    if not current or current[0] != VERB:
+        return False
+    state = _read(reg, STATE_KEY, 'PreviousDefault')
+    previous = json.loads(state[0]) if state else None
+    if previous is None or previous[0] == VERB:
+        # Remove only our own override; Windows' inherited default becomes active.
+        _delete_value(reg, SHELL_KEY)
+    else:
+        _write(reg, SHELL_KEY, None, previous[0], previous[1])
+    if registry is None:
+        _notify_shell()
+    return True
+
+
 def install(command, icon, registry=None):
     reg = registry or _registry()
-    state = _read(reg, STATE_KEY, 'PreviousDefault')
-    if state is None:
-        previous = _read(reg, SHELL_KEY)
-        if previous is not None and previous[0] == VERB:
-            raise RuntimeError('تنظیم قبلی Explorer در دسترس نیست؛ ابتدا گزینهٔ پیش‌فرض پوشه‌ها را در ویندوز بازیابی کن.')
-        # Save the exact presence, value and registry type before changing the default.
-        _write(reg, STATE_KEY, 'PreviousDefault', json.dumps(previous), reg.REG_SZ)
+    restore_legacy_default(reg)
     verb_key = SHELL_KEY + '\\' + VERB
     _write(reg, verb_key, None, 'بازکردن با FaceGate', reg.REG_SZ)
     _write(reg, verb_key, 'Icon', icon, reg.REG_SZ)
     _write(reg, verb_key + r'\command', None, command, reg.REG_SZ)
-    # Set last: a failure before this point cannot hijack folder opening.
-    _write(reg, SHELL_KEY, None, VERB, reg.REG_SZ)
+    # Context menu only: never replace the default navigation verb again.
     if registry is None:
         _notify_shell()
 
 
 def uninstall(registry=None):
     reg = registry or _registry()
-    current = _read(reg, SHELL_KEY)
-    state = _read(reg, STATE_KEY, 'PreviousDefault')
-    if current and current[0] == VERB:
-        if state is None:
-            raise RuntimeError('نسخهٔ پشتیبان تنظیم Explorer پیدا نشد؛ حذف خودکار انجام نشد.')
-        previous = json.loads(state[0])
-        if previous is None:
-            _delete_value(reg, SHELL_KEY)
-        else:
-            _write(reg, SHELL_KEY, None, previous[0], previous[1])
+    restore_legacy_default(reg)
     # A newer default chosen by the user or another application remains untouched.
     _delete_key(reg, SHELL_KEY + '\\' + VERB + r'\command')
     _delete_key(reg, SHELL_KEY + '\\' + VERB)

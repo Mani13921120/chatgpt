@@ -2,6 +2,12 @@ import sys, os, sqlite3, secrets, time, hashlib, ctypes, uuid, subprocess, xml.e
 import shutil
 import traceback
 from pathlib import Path
+if __name__ == '__main__' and os.name == 'nt':
+    try:
+        from explorer_integration import restore_legacy_default
+        restore_legacy_default()
+    except Exception as exc:
+        ctypes.windll.user32.MessageBoxW(None, str(exc), 'FaceGate: Explorer restore failed', 0x10)
 # Shell invocations for ordinary folders must remain fast and must not create data.
 # A protected path is always forwarded to the GUI that owns its Windows handles.
 if __name__ == '__main__' and '--explorer-open' in sys.argv:
@@ -343,7 +349,7 @@ class FaceGate(QMainWindow):
         folder_restore = QPushButton('بازیابی پشتیبان به پوشهٔ جدید'); folder_restore.setObjectName('secondary'); folder_restore.clicked.connect(self.restore_selected_folder_backup)
         right.addWidget(folder_restore); self._folder_mode_widgets.append(folder_restore)
         folder_menu_row = QHBoxLayout()
-        folder_menu_install = QPushButton('فعال‌سازی دابل‌کلیک Explorer'); folder_menu_install.setObjectName('secondary'); folder_menu_install.clicked.connect(self.install_folder_context_menu)
+        folder_menu_install = QPushButton('افزودن گزینهٔ راست‌کلیک FaceGate'); folder_menu_install.setObjectName('secondary'); folder_menu_install.clicked.connect(self.install_folder_context_menu)
         folder_menu_remove = QPushButton('بازگردانی بازکردن عادی Explorer'); folder_menu_remove.setObjectName('secondary'); folder_menu_remove.clicked.connect(self.remove_folder_context_menu)
         folder_menu_row.addWidget(folder_menu_install); folder_menu_row.addWidget(folder_menu_remove); right.addLayout(folder_menu_row)
         self._folder_mode_widgets.extend([folder_menu_install, folder_menu_remove])
@@ -1632,16 +1638,10 @@ foreach ($entry in $rows) {
         if os.name != 'nt':
             QMessageBox.warning(self, 'فقط ویندوز', 'این گزینه فقط در Windows Explorer قابل نصب است.')
             return
-        answer = QMessageBox.question(self, 'اتصال دابل‌کلیک Explorer',
-            'فرمان پیش‌فرض بازکردن پوشه‌ها برای همین حساب به FaceGate متصل شود؟ پوشه‌های ثبت‌نشده عادی باز می‌شوند؛ پوشهٔ قفل‌شده بررسی چهرهٔ ۳ ثانیه‌ای دارد. تنظیم قبلی برای بازگردانی ذخیره می‌شود.\n\n'
-            'این اتصال فرمان Open و دابل‌کلیک را پوشش می‌دهد؛ نوار آدرس، کپی، تغییر نام و دسترسی مستقیم فایل‌ها الزاماً این فرمان را اجرا نمی‌کنند. تا پیش از بازگردانی اتصال، فایل برنامه را جابه‌جا یا حذف نکن.',
-            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
-        if answer != QMessageBox.Yes:
-            return
         try:
             explorer_integration.install(self._folder_context_menu_command(), str(Path(sys.executable).resolve()))
-            QMessageBox.information(self, 'اتصال Explorer فعال شد',
-                'دابل‌کلیک یا فرمان بازکردن استاندارد Explorer اکنون از FaceGate عبور می‌کند. اگر پنجرهٔ Explorer قدیمی تغییر را نگرفت، آن را ببند و دوباره باز کن. دوربین فقط برای پوشهٔ ثبت‌شده و قفل‌شده فعال می‌شود.')
+            QMessageBox.information(self, 'راست‌کلیک FaceGate اضافه شد',
+                'گزینهٔ «بازکردن با FaceGate» به راست‌کلیک اضافه شد. بازکردن عادی و دابل‌کلیک پوشه‌ها به Explorer سپرده می‌شود و تنظیم پیش‌فرض آن تغییر نمی‌کند.')
         except Exception as exc:
             QMessageBox.warning(self, 'ثبت اتصال Explorer ناموفق', str(exc))
 

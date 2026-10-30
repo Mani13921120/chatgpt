@@ -68,21 +68,33 @@ class ShellSettingsTests(unittest.TestCase):
         reg = FakeRegistry()
         shell.install('command', 'icon', reg)
         shell.uninstall(reg)
-        self.assertNotIn(None, reg.keys[shell.SHELL_KEY])
+        self.assertIsNone(shell._read(reg, shell.SHELL_KEY))
 
     def test_uninstall_preserves_newer_user_default(self):
         reg = FakeRegistry()
         shell.install('command', 'icon', reg)
-        reg.keys[shell.SHELL_KEY][None] = ('other-app', reg.REG_SZ)
+        reg.keys.setdefault(shell.SHELL_KEY, {})[None] = ('other-app', reg.REG_SZ)
         shell.uninstall(reg)
         self.assertEqual(reg.keys[shell.SHELL_KEY][None][0], 'other-app')
 
-    def test_missing_recovery_does_not_delete_live_default_command(self):
+    def test_missing_backup_removes_only_facegate_default_override(self):
         reg = FakeRegistry()
         reg.keys[shell.SHELL_KEY] = {None: (shell.VERB, reg.REG_SZ)}
-        with self.assertRaises(RuntimeError):
-            shell.uninstall(reg)
-        self.assertEqual(reg.keys[shell.SHELL_KEY][None][0], shell.VERB)
+        shell.uninstall(reg)
+        self.assertIsNone(shell._read(reg, shell.SHELL_KEY))
+
+    def test_context_menu_install_never_sets_default_verb(self):
+        reg = FakeRegistry()
+        shell.install('command', 'icon', reg)
+        self.assertIsNone(shell._read(reg, shell.SHELL_KEY))
+
+    def test_upgrade_restores_saved_default_and_keeps_context_menu(self):
+        reg = FakeRegistry()
+        reg.keys[shell.SHELL_KEY] = {None: (shell.VERB, reg.REG_SZ)}
+        reg.keys[shell.STATE_KEY] = {'PreviousDefault': ('["explore", 1]', reg.REG_SZ)}
+        shell.install('new-command', 'icon', reg)
+        self.assertEqual(shell._read(reg, shell.SHELL_KEY), ('explore', reg.REG_SZ))
+        self.assertEqual(shell._read(reg, shell.SHELL_KEY + r'\FaceGateOpen\command')[0], 'new-command')
 
 
 class ExplorerRoutingTests(unittest.TestCase):
