@@ -6,7 +6,7 @@ import unittest
 from run_windows_validation import annotation
 
 if hasattr(sys.stdout,'reconfigure'):sys.stdout.reconfigure(encoding='utf-8',errors='backslashreplace')
-suite=unittest.defaultTestLoader.loadTestsFromNames(['test_app_catalog','test_app_runtime'])
+suite=unittest.defaultTestLoader.loadTestsFromNames(['test_app_catalog','test_app_runtime','test_app_monitor','test_guardian'])
 stream=io.StringIO();result=unittest.TextTestRunner(stream=stream,verbosity=2).run(suite)
 print(stream.getvalue())
 summary=f'App tests: {result.testsRun}; failures: {len(result.failures)}; errors: {len(result.errors)}; skipped: {len(result.skipped)}'

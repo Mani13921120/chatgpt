@@ -77,7 +77,7 @@ def launch(app, override=None, cwd=None):
         if not isinstance(override,(list,tuple)) or not override or path_key(override[0]) not in {path_key(p) for p in app.process_paths}:
             raise ValueError('مسیر راه‌اندازی با برنامهٔ انتخاب‌شده مطابقت ندارد.')
         return subprocess.Popen(list(override),cwd=cwd or app.working_directory or str(Path(override[0]).parent),close_fds=True)
-    if os.name=='nt' and app.app_id and not app.app_id.lower().startswith(('exe:','lnk:')):
+    if os.name=='nt' and app.app_id and not ntpath.isabs(app.app_id) and not app.app_id.lower().startswith(('exe:','lnk:')):
         os.startfile('shell:AppsFolder\\'+app.app_id)
         return None
     if os.name=='nt' and app.shortcut:
@@ -124,3 +124,19 @@ def show_window(hwnd,restore):
     user.SetForegroundWindow.argtypes=[wintypes.HWND]
     user.ShowWindow(hwnd,9 if restore else 6)
     if restore:user.SetForegroundWindow(hwnd)
+
+
+def foreground_window():
+    if os.name != 'nt':
+        return 0, None
+    user = ctypes.WinDLL('user32', use_last_error=True)
+    user.GetForegroundWindow.restype = wintypes.HWND
+    hwnd = user.GetForegroundWindow()
+    pid = window_pid(hwnd, True)
+    if not pid:
+        return int(hwnd or 0), None
+    try:
+        import psutil
+        return int(hwnd), psutil.Process(pid).exe()
+    except (psutil.Error, OSError):
+        return int(hwnd), None

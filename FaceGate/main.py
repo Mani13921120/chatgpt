@@ -9,6 +9,9 @@ if __name__ == '__main__' and os.name == 'nt' and not getattr(sys, 'frozen', Fal
     launcher = scripts / ('pythonw.exe' if Path(sys.executable).name.lower() == 'pythonw.exe' else 'python.exe')
     if launcher.is_file() and Path(sys.executable).resolve().parent != scripts.resolve():
         raise SystemExit(subprocess.call([str(launcher), str(Path(__file__).resolve()), *sys.argv[1:]]))
+if __name__ == '__main__' and '--guardian' in sys.argv[1:]:
+    from guardian import run as run_guardian
+    raise SystemExit(run_guardian(Path(os.getenv('LOCALAPPDATA', str(Path.home()))) / 'FaceGate', Path(__file__).resolve()))
 if __name__ == '__main__' and os.name == 'nt':
     try:
         from explorer_integration import restore_legacy_default
@@ -38,6 +41,8 @@ import folder_inplace_crypto as inplace_crypto
 import explorer_integration
 import app_catalog
 import app_runtime
+from app_monitor import Monitor
+import guardian_state
 import threading
 from collections import deque
 from folder_auth import FOLDER_AUTH_SECONDS, FolderFaceAttempt
@@ -51,7 +56,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPush
     QLineEdit, QVBoxLayout, QHBoxLayout, QGridLayout, QMessageBox, QFrame, QInputDialog, QFileDialog, QListWidget, QListWidgetItem, QSystemTrayIcon, QMenu, QStyle, QScrollArea, QDialog, QDialogButtonBox, QAbstractItemView, QComboBox, QFileIconProvider)
 
 APP_DIR = Path(os.getenv('LOCALAPPDATA', str(Path.home()))) / 'FaceGate'
-APP_VERSION = '0.4.0'
+APP_VERSION = '0.5.0'
 APP_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = APP_DIR / 'users.db'
 MODEL_DIR = Path(__file__).resolve().parent / 'models'
@@ -237,6 +242,9 @@ class FaceGate(QMainWindow):
         self._inventory_jobs = []
         QApplication.instance().aboutToQuit.connect(self._stop_inventory_jobs)
         self._app_scan_active = False
+        self._app_monitor = Monitor(Path(__file__).resolve())
+        self._guardian_launch = None
+        self._guardian_next_check = 0.0
         self._allow_next_foreground = {}
         self._last_foreground_key = None
         self._last_gate_event = 0.0
@@ -288,6 +296,17 @@ class FaceGate(QMainWindow):
         # Privacy-first: do not open the webcam until authentication/enrollment is requested.
         self.stop_camera()
         self.video.setText('دوربین خاموش است؛ هنگام نیاز به احراز هویت فعال می‌شود.')
+        self._guardian_timer = QTimer(self)
+        self._guardian_timer.setInterval(500)
+        self._guardian_timer.timeout.connect(self._update_guardian)
+        QApplication.instance().aboutToQuit.connect(self._clear_gui_state)
+        if os.name == 'nt':
+            previous = guardian_state.read(APP_DIR, 'guardian', Path(__file__).resolve())
+            if previous:
+                self._app_sessions.authorized = {key: stamp for key, stamp in previous.get('sessions', {}).items() if key in self._app_targets}
+                self._app_monitor.known = {tuple(item) for item in previous.get('known', ())}
+            self._guardian_timer.start()
+            QTimer.singleShot(0, self._update_guardian)
 
     def _build_ui(self):
         self.setStyleSheet('''
@@ -352,7 +371,13 @@ class FaceGate(QMainWindow):
         startup_btn.setObjectName('secondary')
         startup_btn.clicked.connect(self.toggle_startup_registration)
         right.addWidget(startup_btn)
-        exit_btn = QPushButton('خروج کامل و بستن FaceGate')
+        self.guardian_status = QLabel('نگهبان مستقل در حال بررسی…' if os.name == 'nt' else 'نگهبان مستقل مخصوص ویندوز است')
+        self.guardian_status.setWordWrap(True); right.addWidget(self.guardian_status)
+        self.guardian_button = QPushButton('تنظیم نگهبان مستقل')
+        self.guardian_button.setObjectName('secondary')
+        self.guardian_button.clicked.connect(self.toggle_guardian)
+        right.addWidget(self.guardian_button)
+        exit_btn = QPushButton('بستن رابط FaceGate')
         exit_btn.setObjectName('danger')
         exit_btn.clicked.connect(self._exit_application)
         right.addWidget(exit_btn)
@@ -1818,7 +1843,7 @@ foreach ($entry in $rows) {
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
         self.tray = QSystemTrayIcon(QApplication.style().standardIcon(QStyle.SP_ComputerIcon), self)
-        self.tray.setToolTip('FaceGate — محافظت فعال تا زمانی که برنامه در حال اجراست')
+        self.tray.setToolTip('FaceGate — رابط احراز هویت')
         menu = QMenu()
         show_action = QAction('باز کردن FaceGate', self)
         show_action.triggered.connect(self._restore_from_tray)
@@ -1829,12 +1854,71 @@ foreach ($entry in $rows) {
         startup_action.triggered.connect(self.toggle_startup_registration)
         menu.addAction(startup_action)
         menu.addSeparator()
-        exit_action = QAction('خروج کامل (محافظت متوقف می‌شود)', self)
+        exit_action = QAction('بستن رابط (نگهبان ادامه می‌دهد)', self)
         exit_action.triggered.connect(self._exit_application)
         menu.addAction(exit_action)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(lambda reason: self._restore_from_tray() if reason == QSystemTrayIcon.DoubleClick else None)
         self.tray.show()
+
+    def _publish_gui_state(self):
+        if os.name == 'nt':
+            guardian_state.publish(APP_DIR, 'gui', self._app_sessions, known=self._app_monitor.known)
+
+    def _clear_gui_state(self):
+        if os.name == 'nt':
+            try:
+                # Leave the final snapshot for the independent monitor to consume
+                # once, even when this process exits between two of its ticks.
+                self._publish_gui_state()
+            except (OSError, sqlite3.Error):
+                pass
+
+    def _update_guardian(self):
+        if os.name != 'nt':
+            return
+        try:
+            self._publish_gui_state()
+            queued = {item['key'] for item in self._app_gate_queue}
+            pending = (self._pending_app_unlock or {}).get('key')
+            for request in guardian_state.take_requests(APP_DIR, self._app_targets):
+                if request['key'] != pending and request['key'] not in queued and len(self._app_gate_queue) < 16:
+                    self._app_gate_queue.append(request); queued.add(request['key'])
+            if not guardian_state.enabled(APP_DIR):
+                self.guardian_status.setText('نگهبان مستقل خاموش است؛ بستن رابط، پایش برنامه‌ها را متوقف می‌کند.')
+                self.guardian_button.setText('فعال‌سازی نگهبان مستقل')
+                return
+            self.guardian_button.setText('توقف نگهبان مستقل با رمز / PIN')
+            snapshot = guardian_state.read(APP_DIR, 'guardian', Path(__file__).resolve())
+            if snapshot:
+                if snapshot.get('error') or time.time() - snapshot['updated'] > 5:
+                    self.guardian_status.setText('نگهبان پاسخ سالم نداده است؛ guardian.log را بررسی کنید.')
+                else:
+                    self.guardian_status.setText('نگهبان مستقل فعال است؛ پس از بستن رابط هم پایش ادامه دارد.')
+            elif time.monotonic() >= self._guardian_next_check:
+                if self._guardian_launch is None or self._guardian_launch.poll() is not None:
+                    self._guardian_launch = guardian_state.spawn(Path(__file__).resolve(), '--guardian')
+                self._guardian_next_check = time.monotonic() + 5
+                self.guardian_status.setText('در حال راه‌اندازی نگهبان مستقل…')
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            self.guardian_status.setText(f'راه‌اندازی یا ارتباط با نگهبان انجام نشد: {exc}')
+
+    def toggle_guardian(self):
+        if os.name != 'nt':
+            return
+        if not self._require_management_password('تأیید تغییر نگهبان مستقل'):
+            return
+        try:
+            value = not guardian_state.enabled(APP_DIR)
+            if not value and QMessageBox.warning(self, 'توقف نگهبان مستقل',
+                    'با توقف نگهبان، پس از بستن رابط دیگر پایش برنامه‌ها ادامه نمی‌یابد. قفل ذخیره‌شدهٔ پوشه‌ها باقی می‌ماند. ادامه می‌دهید؟',
+                    QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel) != QMessageBox.Yes:
+                return
+            guardian_state.set_enabled(APP_DIR, value)
+            self._guardian_next_check = 0
+            self._update_guardian()
+        except (OSError, sqlite3.Error) as exc:
+            QMessageBox.warning(self, 'نگهبان مستقل', str(exc))
 
     def _restore_from_tray(self):
         self.showNormal()
@@ -1845,7 +1929,7 @@ foreach ($entry in $rows) {
         if not self._require_management_password('تأیید خروج کامل'):
             return
         answer = QMessageBox.warning(self, 'خروج کامل از FaceGate',
-            'با خروج کامل، پایش برنامه‌ها متوقف می‌شود. پیش از خروج، FaceGate تلاش می‌کند محتوای تمام پوشه‌های باز را دوباره رمزگذاری کند. ممکن است چند دقیقه طول بکشد. خارج می‌شوی؟',
+            'پنجره و دوربین بسته می‌شوند؛ نگهبان مستقل در صورت فعال‌بودن ادامه می‌دهد و هنگام اجرای برنامهٔ قفل‌شده دوباره احراز هویت می‌خواهد. ابتدا پوشه‌های باز دوباره رمزگذاری می‌شوند. برای توقف نگهبان از دکمهٔ جداگانهٔ آن استفاده کنید. رابط بسته شود؟',
             QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
         if answer != QMessageBox.Yes:
             return
@@ -1861,6 +1945,7 @@ foreach ($entry in $rows) {
             QMessageBox.critical(self, 'خروج ایمن انجام نشد', 'FaceGate نتوانست همهٔ پوشه‌های باز را رمزگذاری کند؛ برنامه برای جلوگیری از باقی‌ماندن فایل خوانا بسته نمی‌شود.\n\n' + '\n\n'.join(failures))
             return
         self._allow_real_exit = True
+        self._clear_gui_state()
         if self.tray:
             self.tray.hide()
         self.stop_camera()
@@ -1923,12 +2008,15 @@ foreach ($entry in $rows) {
         key = pending['key']
         app = self._app_targets.get(key)
         if app is None:
+            self._pending_app_unlock = None; self.mode = 'idle'; self._gate_active = False
+            self.stop_camera()
             self.status.setText('این برنامه دیگر در فهرست محافظت نیست؛ درخواست لغو شد.')
             return
         self._app_sessions.grant(key)
         try:
+            self._publish_gui_state()
             hwnd = int(pending.get('hwnd') or 0)
-            if hwnd and app_runtime.window_pid(hwnd, True) == pending.get('pid'):
+            if hwnd and self._pending_window_matches(app, pending):
                 app_runtime.show_window(hwnd, True)
             else:
                 app_runtime.launch(app, pending.get('command'), pending.get('cwd'))
@@ -1938,9 +2026,22 @@ foreach ($entry in $rows) {
             self.hide()
         except Exception as exc:
             self._app_sessions.revoke(key)
+            self._clear_gui_state()
             self._pending_app_unlock = None; self.mode = 'idle'; self._gate_active = False
             self.stop_camera()
             self.status.setText(f'اجرای «{app.name}» ناموفق بود؛ مجوز موقت لغو شد: {exc}')
+
+    @staticmethod
+    def _pending_window_matches(app, pending):
+        if app_runtime.window_pid(pending['hwnd'], True) != pending.get('pid'):
+            return False
+        try:
+            proc = psutil.Process(pending['pid'])
+            if pending.get('started') is None or proc.create_time() != pending['started']:
+                return False
+            return app_runtime.matches(app, proc.exe(), proc.cmdline(), app_runtime.process_app_id(proc.pid))
+        except (psutil.Error, OSError):
+            return False
 
     def load_locked_apps(self):
         if not hasattr(self, 'app_list'):
@@ -1949,6 +2050,7 @@ foreach ($entry in $rows) {
         con = db()
         self._app_targets = app_runtime.load_apps(con)
         self._known_processes = {(p.info['pid'], p.info.get('create_time')) for p in psutil.process_iter(['pid','create_time'], ad_value=None)}
+        self._app_monitor.known = set(self._known_processes)
         rows = sorted(con.execute('SELECT path, display_name, enabled FROM locked_apps').fetchall(), key=lambda row: row[1].casefold())
         con.close()
         icon_provider = QFileIconProvider()
@@ -2103,40 +2205,7 @@ foreach ($entry in $rows) {
 
     @staticmethod
     def _foreground_process_path():
-        """Return (window handle, executable path) for the foreground Windows process."""
-        if os.name != 'nt':
-            return 0, None
-        try:
-            user32 = ctypes.windll.user32
-            kernel32 = ctypes.windll.kernel32
-            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-            kernel32.OpenProcess.restype = wintypes.HANDLE
-            kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
-            kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
-            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-            kernel32.CloseHandle.restype = wintypes.BOOL
-            user32.GetForegroundWindow.restype = wintypes.HWND
-            hwnd = user32.GetForegroundWindow()
-            if not hwnd:
-                return 0, None
-            pid = wintypes.DWORD(0)
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            if not pid.value:
-                return int(hwnd), None
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
-            if not handle:
-                return int(hwnd), None
-            try:
-                size = wintypes.DWORD(32768)
-                buffer = ctypes.create_unicode_buffer(size.value)
-                if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
-                    return int(hwnd), str(Path(buffer.value).resolve())
-            finally:
-                kernel32.CloseHandle(handle)
-        except Exception:
-            pass
-        return 0, None
+        return app_runtime.foreground_window()
 
     def check_locked_foreground_app(self):
         if self._app_scan_active:
@@ -2148,66 +2217,18 @@ foreach ($entry in $rows) {
             self._app_scan_active = False
 
     def _scan_app_processes(self):
-        targets = self._app_targets
-        if not targets:
+        if not self._app_targets:
             self._app_gate_queue.clear()
             return
-        hwnd, fg_exe = self._foreground_process_path()
-        fg_pid = app_runtime.window_pid(hwnd, True) if hwnd else 0
-        snapshots = []
-        live = set(); live_keys = set()
-        packaged = any(app.packaged for app in targets.values())
-        normalized_paths = {app.key:{app_catalog.path_key(path) for path in app.process_paths} for app in targets.values()}
-        package_paths = set().union(*(normalized_paths[app.key] for app in targets.values() if app.packaged)) if packaged else set()
-        for proc in psutil.process_iter(['pid','exe','cmdline','create_time'], ad_value=None):
-            try:
-                info = proc.info
-                pid = info['pid']; identity = (pid,info.get('create_time'))
-                live.add(identity)
-                if app_catalog.internal_pid(pid): continue
-                exe = info.get('exe') or ''
-                if not exe: continue
-                command = info.get('cmdline') or [exe]
-                if app_catalog.internal_command(command, Path(__file__).resolve()):continue
-                normalized_exe = app_catalog.path_key(exe)
-                app_id = self._app_identity_cache.get(identity,'')
-                if packaged and (identity not in self._app_identity_cache or (not app_id and pid==fg_pid)) and (identity not in self._known_processes or pid == fg_pid or normalized_exe in package_paths):
-                    app_id = app_runtime.process_app_id(pid)
-                    self._app_identity_cache[identity] = app_id
-                matches = [app for app in targets.values() if app_runtime.matches(app,exe,command,app_id,normalized_paths[app.key],normalized_exe)]
-                live_keys.update(app.key for app in matches)
-                if matches: snapshots.append((proc,info,identity,matches))
-            except (psutil.NoSuchProcess,psutil.AccessDenied,OSError): continue
-        self._app_sessions.observe(live_keys)
-        self._app_identity_cache = {key:value for key,value in self._app_identity_cache.items() if key in live}
-        pending_key = (self._pending_app_unlock or {}).get('key')
-        queued_keys = {item['key'] for item in self._app_gate_queue}
-        for proc,info,identity,matches in snapshots:
-            keys = [app.key for app in matches]
-            if self._app_sessions.allows(keys): continue
-            if pending_key in keys or queued_keys.intersection(keys): continue
-            new = identity not in self._known_processes
-            foreground = info['pid'] == fg_pid
-            if not new and not foreground: continue
-            app = matches[0]
-            request = {'key':app.key,'name':app.name,'exe':info['exe'],'pid':info['pid'],
-                       'command':None if app.packaged else (info.get('cmdline') or [info['exe']]),
-                       'hwnd':0,'cwd':app.working_directory}
-            if not new and foreground:
-                request['hwnd'] = int(hwnd)
-                app_runtime.show_window(hwnd,False)
-            else:
-                try:
-                    if proc.create_time() != identity[1]: continue
-                    try: request['cwd'] = proc.cwd()
-                    except (psutil.Error,OSError): pass
-                    proc.terminate()
-                except (psutil.Error,OSError):
-                    self.status.setText(f'ویندوز اجازهٔ توقف «{app.name}» را نداد؛ قفل این اجرا تأیید نشد.')
-                    continue
+        pending = {(self._pending_app_unlock or {}).get('key')}
+        pending.update(item['key'] for item in self._app_gate_queue)
+        requests, errors = self._app_monitor.scan(self._app_targets, self._app_sessions,
+                                                 pending, self._foreground_process_path())
+        for request in requests:
             if len(self._app_gate_queue) < 16:
-                self._app_gate_queue.append(request); queued_keys.add(app.key)
-        self._known_processes = live
+                self._app_gate_queue.append(request)
+        if errors:
+            self.status.setText(errors[-1])
         if (self._app_gate_queue and self.mode == 'idle' and self._pending_app_unlock is None
                 and self._folder_worker is None and not self._folder_prompt_active
                 and QApplication.activeModalWidget() is None):
@@ -2529,16 +2550,17 @@ foreach ($entry in $rows) {
 
     def closeEvent(self, event):
         # Closing the window hides it to the tray so the monitor keeps running.
-        # This is not a security boundary: terminating the process still stops monitoring.
+        # An independent user-session guardian handles requests after GUI exit.
         if self.tray is not None and not self._allow_real_exit:
             if self._pending_app_unlock is not None or self.mode in {'login', 'enroll'}:
                 self.cancel_action()
             self.hide()
-            self.tray.showMessage('FaceGate در پس‌زمینه فعال است', 'پایش برنامه‌ها ادامه دارد تا وقتی FaceGate در حال اجرا باشد.', QSystemTrayIcon.Information, 3500)
+            self.tray.showMessage('FaceGate در پس‌زمینه فعال است', 'پایش برنامه‌ها و نگهبان مستقل طبق تنظیمات ادامه دارند.', QSystemTrayIcon.Information, 3500)
             event.ignore()
             return
         self.stop_camera()
         self.app_lock_timer.stop()
+        self._guardian_timer.stop()
         event.accept()
 
 
@@ -2645,7 +2667,7 @@ def main():
     queued = []
     instance.request_received.connect(queued.append)
     folder_auth_action = action in {'open-face', 'open-pin'} and bool(folder_path)
-    is_autostart = '--autostart' in sys.argv[1:]
+    is_autostart = any(flag in sys.argv[1:] for flag in ('--autostart', '--guardian-wake'))
     if action and folder_path:
         mode = 'folders'
     elif is_autostart:
