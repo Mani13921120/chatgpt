@@ -93,7 +93,9 @@ def write_manifest(folder: str | Path, metadata_root: str | Path, envelope: dict
     base.mkdir(parents=True, exist_ok=True)
     dest = manifest_path(root, base)
     record = {
-        "format": "FGINPLACE2",
+        # Older clients only restore a root ACL. They must not modify folders
+        # whose recovery also includes child ACLs and a shared parent guard.
+        "format": "FGINPLACE3",
         "root": str(root),
         "state": state,
         "key_envelope": envelope,
@@ -124,7 +126,7 @@ def read_manifest(path: str | Path) -> dict | None:
         value = json.loads(p.read_text(encoding="utf-8"))
         if not isinstance(value, dict):
             return None
-        if value.get("format") != "FGINPLACE2" or not isinstance(value.get("key_envelope"), dict):
+        if value.get("format") not in {"FGINPLACE2", "FGINPLACE3"} or not isinstance(value.get("key_envelope"), dict):
             return None
         return value
     except (OSError, PermissionError, ValueError, TypeError, json.JSONDecodeError):
@@ -641,7 +643,7 @@ def inspect_folder(folder: str | Path) -> dict:
 
 
 # Public operations combine content encryption and the Windows directory gate.
-# Keep the existing on-disk FGINPLACE2 format and recovery vault compatibility.
+# Read legacy manifests; write the new recovery contract. File/vault bytes remain compatible.
 import folder_gate
 
 _content_protect = protect_folder_in_place

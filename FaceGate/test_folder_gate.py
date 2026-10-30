@@ -13,6 +13,16 @@ import folder_inplace_crypto as crypto
 
 
 class AuthenticationTests(unittest.TestCase):
+    def test_manifest_upgrade_accepts_legacy_and_marks_new_recovery_contract(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / 'selected'; root.mkdir()
+            mp = crypto.write_manifest(root, Path(d) / 'metadata', {}, '', 'locked')
+            self.assertEqual(crypto.read_manifest(mp)['format'], 'FGINPLACE3')
+            value = json.loads(mp.read_text())
+            value['format'] = 'FGINPLACE2'
+            mp.write_text(json.dumps(value))
+            self.assertIsNotNone(crypto.read_manifest(mp))
     def test_lock_handles_request_real_read_access_for_sharing_enforcement(self):
         kernel = Mock()
         kernel.CreateFileW.return_value = 42
