@@ -13,6 +13,32 @@ import folder_inplace_crypto as crypto
 
 
 class AuthenticationTests(unittest.TestCase):
+    def test_empty_folder_and_empty_subdirectories_support_full_lifecycle(self):
+        import vault_crypto
+        for nested in (False, True):
+            with self.subTest(nested=nested), tempfile.TemporaryDirectory() as d:
+                base = Path(d)
+                root = base / 'selected'; root.mkdir()
+                if nested:
+                    (root / 'empty-child').mkdir()
+                metadata = base / 'metadata'
+                with patch.object(vault_crypto, '_dpapi_protect', side_effect=lambda b: b), \
+                     patch.object(vault_crypto, '_dpapi_unprotect', side_effect=lambda b: b), \
+                     patch.object(gate, '_api'), patch.object(gate, 'engage') as engage:
+                    result = crypto.protect_folder_in_place(root, '12345678', metadata, base / 'backups')
+                    self.assertEqual(result['file_count'], 0)
+                    self.assertEqual(crypto.read_manifest(result['manifest_path'])['state'], 'locked')
+                    self.assertTrue(Path(result['backup_path']).is_file())
+                    engage.assert_called_once()
+                    with self.assertRaises(RuntimeError):
+                        crypto.unlock_folder_in_place(root, metadata, pin='87654321')
+                    crypto.unlock_folder_in_place(root, metadata, pin='12345678')
+                    (root / 'later.txt').write_text('added after unlocking')
+                    crypto.lock_folder_in_place(root, metadata)
+                    self.assertTrue(crypto.is_encrypted_file(root / 'later.txt'))
+                    crypto.unprotect_folder_in_place(root, metadata, '12345678')
+                    self.assertEqual((root / 'later.txt').read_text(), 'added after unlocking')
+
     def test_unprotect_restores_contents_and_retires_manifest_without_deleting_backup(self):
         with tempfile.TemporaryDirectory() as d:
             base = Path(d)
@@ -133,6 +159,19 @@ class WindowsIntegrationTests(unittest.TestCase):
         self.root.rename(self.base / 'renamed')
         (self.base / 'renamed').rename(self.root)
         shutil.copytree(self.root, self.base / 'copy')
+
+    def test_empty_tree_has_real_directory_gate_and_can_be_unprotected(self):
+        (self.root / 'nested' / 'data.txt').unlink()
+        metadata = self.base / 'metadata'
+        result = crypto.protect_folder_in_place(self.root, '12345678', metadata, self.base / 'backups')
+        self.mp = Path(result['manifest_path'])
+        self.assertEqual(result['file_count'], 0)
+        self.assertTrue(gate.active(self.root))
+        with self.assertRaises(OSError):
+            list(self.root.iterdir())
+        crypto.unprotect_folder_in_place(self.root, metadata, '12345678', manifest=self.mp)
+        self.assertEqual(list(self.root.iterdir()), [self.root / 'nested'])
+        self.assertEqual(gate._get_dacl(self.root), self.original)
 
     def test_full_crypto_and_pin_workflow(self):
         metadata = self.base / 'metadata'

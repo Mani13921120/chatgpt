@@ -488,8 +488,8 @@ def protect_folder_in_place(folder: str | Path, pin: str, metadata_root: str | P
     if current_files:
         raise RuntimeError("در این پوشه فایل‌های رمزگذاری‌شدهٔ FaceGate از قبل پیدا شد؛ برای جلوگیری از دوباره‌رمزگذاری، از عملیات بازیابی/بازکردن استفاده کن.")
     normal_files = walk_regular_files(root)
-    if not normal_files:
-        raise RuntimeError("پوشه فایل قابل رمزگذاری ندارد. ابتدا فایل‌ها را داخل آن قرار بده.")
+    # Directory protection is independent of file count. Empty trees still need
+    # a key envelope and manifest for authenticated ACL restoration/unprotection.
     key, envelope = make_key_envelope(pin)
     ident = folder_id(root)
     backup = _backup_before_first_protect(root, Path(backup_root), ident, pin)
