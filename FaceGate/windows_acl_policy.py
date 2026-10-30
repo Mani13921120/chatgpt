@@ -95,6 +95,13 @@ def relative_path(root, relative):
     return Path(root).joinpath(*rel.parts)
 
 
+def ensure_external_metadata(root, location):
+    source = Path(os.path.realpath(os.path.abspath(root)))
+    target = Path(os.path.realpath(os.path.abspath(location)))
+    if target == source or source in target.parents:
+        raise RuntimeError('کلیدها، پشتیبان و اطلاعات بازیابی باید خارج از پوشهٔ انتخاب‌شده بمانند.')
+
+
 def validate(value, root):
     if value.get('version') != 2:
         return

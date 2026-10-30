@@ -804,14 +804,14 @@ class FaceGate(QMainWindow):
         app_root = APP_DIR.resolve()
         code_root = Path(__file__).resolve().parent
         try:
-            if folder == code_root or folder in code_root.parents:
+            if folder == code_root or folder in code_root.parents or code_root in folder.parents:
                 raise RuntimeError(f'برای جلوگیری از رمزگذاری خود برنامه و فایل‌های نصب، این مسیر پشتیبانی نمی‌شود: {folder}')
         except OSError:
             pass
         if folder == home_root:
             raise RuntimeError('قفل‌کردن ریشه پروفایل کاربر می‌تواند FaceGate و برنامه‌های دیگر را از کار بیندازد؛ یک زیرپوشه را انتخاب کن.')
         try:
-            if folder == app_root or folder in app_root.parents:
+            if folder == app_root or folder in app_root.parents or app_root in folder.parents:
                 raise RuntimeError(f'برای جلوگیری از قفل‌شدن اطلاعات داخلی FaceGate، این مسیر پشتیبانی نمی‌شود: {folder}')
         except OSError:
             pass

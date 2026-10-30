@@ -186,6 +186,7 @@ def _restore_existing(root, manifest, value):
 def engage(root, manifest):
     """Journal all original ACLs, apply tree/parent guards, then verify Windows."""
     root = Path(os.path.realpath(os.path.abspath(root)))
+    policy.ensure_external_metadata(root, manifest)
     policy.preflight_parent(root)
     if active(root):
         verify_lock(root, manifest)

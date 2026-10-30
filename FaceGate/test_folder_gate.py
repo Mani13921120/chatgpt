@@ -272,6 +272,20 @@ class WindowsIntegrationTests(unittest.TestCase):
         gate.disengage(self.root, self.mp)
         self.assertEqual((self.root / 'nested' / 'data.txt').read_text(), 'original data')
 
+    def test_crypto_cycle_preserves_explicit_file_permissions(self):
+        import windows_acl_policy as policy
+        file = self.root / 'nested' / 'data.txt'
+        current = policy.dacl(file)
+        explicit = 'D:P(D;;0x00000002;;;BG)' + current[current.index('('):]
+        policy.set_dacl(file, explicit, policy.identity(file))
+        original = policy.dacl(file)
+        metadata = self.base / 'metadata'
+        result = crypto.protect_folder_in_place(self.root, '12345678', metadata, self.base / 'backups')
+        self.mp = Path(result['manifest_path'])
+        crypto.unlock_folder_in_place(self.root, metadata, pin='12345678', manifest=self.mp)
+        self.assertEqual(file.read_text(), 'original data')
+        self.assertEqual(policy.dacl(file), original)
+
 
 if __name__ == '__main__':
     unittest.main()

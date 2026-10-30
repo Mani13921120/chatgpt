@@ -7,6 +7,13 @@ import windows_acl_policy as policy
 
 
 class AclPolicySafetyTests(unittest.TestCase):
+    def test_recovery_metadata_cannot_be_locked_inside_selected_tree(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / 'selected'
+            for location in (root, root / 'keys', root / 'keys' / 'metadata.json'):
+                with self.subTest(location=location), self.assertRaises(RuntimeError):
+                    policy.ensure_external_metadata(root, location)
+            policy.ensure_external_metadata(root, Path(d) / 'external-keys')
     def test_relative_metadata_paths_cannot_escape_selected_root(self):
         for path in ('../outside', r'\outside', r'C:\outside', r'C:outside', r'\\server\share', 'file:stream'):
             with self.subTest(path=path), self.assertRaises(RuntimeError):

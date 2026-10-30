@@ -266,6 +266,27 @@ def _header_mac(key: bytes, fields: dict) -> str:
     return hmac.new(key, MAGIC + _json_bytes(fields), hashlib.sha256).hexdigest()
 
 
+def _replace_content(temp: Path, original: Path):
+    """Keep Windows file permissions when atomically replacing its contents."""
+    if os.name != 'nt':
+        os.replace(temp, original)
+        return
+    import ctypes
+    from ctypes import wintypes
+    from windows_acl_policy import dacl, identity, set_dacl
+    # A freshly created temp file has inherited permissions, which may differ
+    # from an original's explicit/protected ACL. Preserve those flags as well.
+    set_dacl(temp, dacl(original), identity(temp))
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    replace = kernel.ReplaceFileW
+    replace.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                        wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p]
+    replace.restype = wintypes.BOOL
+    # No IGNORE_MERGE_ERRORS fallback: a security/stream merge failure is an error.
+    if not replace(str(original), str(temp), None, 0, None, None):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
 def encrypt_file_in_place(path: str | Path, key: bytes, envelope: dict) -> bool:
     """Encrypt one plain file atomically. Returns False when it was already encrypted."""
     p = Path(path)
@@ -322,7 +343,7 @@ def encrypt_file_in_place(path: str | Path, key: bytes, envelope: dict) -> bool:
             if not original_writable:
                 os.chmod(p, original_mode | stat.S_IWRITE)
             os.chmod(temp, original_mode | stat.S_IWRITE)
-            os.replace(temp, p)
+            _replace_content(temp, p)
             os.chmod(p, original_mode)
         except Exception:
             if p.exists() and not original_writable:
@@ -392,7 +413,7 @@ def decrypt_file_in_place(path: str | Path, key: bytes) -> bool:
             if originally_readonly:
                 os.chmod(p, original_mode | stat.S_IWRITE)
             os.chmod(temp, desired_mode | stat.S_IWRITE)
-            os.replace(temp, p)
+            _replace_content(temp, p)
             os.chmod(p, desired_mode)
         except Exception:
             if p.exists() and originally_readonly:
@@ -629,6 +650,8 @@ def folder_gate_active(folder):
 
 
 def protect_folder_in_place(folder, pin, metadata_root, backup_root):
+    folder_gate.policy.ensure_external_metadata(folder, metadata_root)
+    folder_gate.policy.ensure_external_metadata(folder, backup_root)
     folder_gate._api(folder)  # Check parent rights and native support before data changes.
     result = _content_protect(folder, pin, metadata_root, backup_root)
     try:
