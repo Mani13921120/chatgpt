@@ -15,11 +15,11 @@ jobs:
       run:
         working-directory: FaceGate
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
-      - name: Install cryptography
-        run: python -m pip install cryptography
+      - name: Install Windows dependencies
+        run: python -m pip install cryptography pywin32
       - name: Test real NTFS, CMD and PowerShell access
         run: python -u run_windows_validation.py

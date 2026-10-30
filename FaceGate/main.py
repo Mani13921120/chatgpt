@@ -775,11 +775,13 @@ class FaceGate(QMainWindow):
     def _validate_folder_target(self, folder_path):
         if os.name != 'nt':
             raise RuntimeError('این قابلیت فقط روی Windows/NTFS پشتیبانی می‌شود.')
-        folder = Path(os.path.abspath(os.path.expandvars(str(folder_path))))
+        folder = Path(os.path.abspath(os.path.expandvars(str(folder_path)))).resolve()
         if not folder.exists() or not folder.is_dir():
             raise RuntimeError('پوشه انتخاب‌شده پیدا نشد یا پوشه نیست.')
         if folder == Path(folder.anchor) or folder.parent == folder:
             raise RuntimeError('انتخاب ریشه درایو مجاز نیست؛ یک پوشه معمولی را انتخاب کن.')
+        if folder.parent == Path(folder.anchor):
+            raise RuntimeError('برای جلوگیری از تغییر مجوز ریشهٔ درایو، یک زیرپوشه داخل پوشهٔ شخصی انتخاب کن.')
         # Do not allow system roots or folders whose locking would affect FaceGate itself.
         forbidden_roots = [Path(os.environ.get('WINDIR', r'C:\Windows')).resolve(),
                            Path(os.environ.get('ProgramFiles', r'C:\Program Files')).resolve(),
@@ -1064,6 +1066,14 @@ foreach ($entry in $rows) {
             QMessageBox.warning(self, 'مسیر پوشه مجاز نیست', str(exc))
             return False
         existing = self._folder_record(folder)
+        con = db()
+        try:
+            registered = [Path(row[0]).resolve() for row in con.execute('SELECT path FROM protected_folders')]
+        finally:
+            con.close()
+        if any(other != folder and (other in folder.parents or folder in other.parents) for other in registered):
+            QMessageBox.warning(self, 'پوشه‌های تو در تو', 'پوشهٔ انتخابی با یک پوشهٔ محافظت‌شده هم‌پوشانی دارد؛ ابتدا محافظت قبلی را بردار.')
+            return False
         if existing and self._is_modern_folder_record(existing):
             QMessageBox.information(self, 'پوشه از قبل ثبت شده', 'این پوشه قبلاً در FaceGate ثبت شده است. برای پوشهٔ قفل‌شده از «بازکردن با چهره/PIN» و برای محتوای باز از «رمزگذاری مجدد» استفاده کن.')
             return False
@@ -1084,7 +1094,7 @@ foreach ($entry in $rows) {
             return False
         answer = QMessageBox.warning(self, 'رمزگذاری محتوا در محل اصلی',
             'FaceGate ابتدا یک نسخهٔ پشتیبان رمزگذاری‌شده در پوشهٔ دادهٔ خودش می‌سازد و آن را بررسی می‌کند. سپس محتوای هر فایل را در همان مسیر با AES-256-GCM رمزگذاری می‌کند؛ نام‌ها و پوشه‌بندی حفظ می‌شوند و فایل گاوصندوق کنار پوشه ساخته نمی‌شود.\n\n'
-            'خود پوشه با مجوزهای ویندوز بسته می‌شود. هنگام اجرای FaceGate، قفل‌های اشتراک نیز کپی، تغییر نام و حذف را محدود می‌کنند. ابتدا برنامه‌های باز روی پوشه را ببند. مدیر سیستم یا توقف اجباری برنامه می‌تواند این محدودیت‌ها را دور بزند. ادامه می‌دهی؟',
+            'مجوزهای محدودکننده روی خود پوشه، فایل‌ها و زیرپوشه‌ها ذخیره می‌شوند. برای جلوگیری از حذف خود پوشه، یک محدودیت حذف در والد نیز ثبت و هنگام بازکردن قفل بازگردانده می‌شود. ابتدا برنامه‌های باز روی پوشه را ببند. ادامه می‌دهی؟',
             QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
         if answer != QMessageBox.Yes:
             return False
@@ -1360,9 +1370,6 @@ foreach ($entry in $rows) {
         if not self._is_modern_folder_record(record):
             QMessageBox.warning(self, 'نسخهٔ قدیمی پوشه', 'این پوشه از نسخهٔ قدیمی EFS/ACL است؛ ابتدا آن را بازیابی کن.')
             return False
-        if inplace_crypto.folder_gate_active(record['path']):
-            QMessageBox.information(self, 'پوشه قفل است', 'قفل خود پوشه فعال است.')
-            return True
         if record['locked'] and not inplace_crypto.folder_gate.saved(record['path'], record['backup']):
             try:
                 encrypted_count = len(inplace_crypto.list_encrypted_files(record['path']))

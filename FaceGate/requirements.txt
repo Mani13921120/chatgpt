@@ -3,3 +3,4 @@ opencv-contrib-python>=4.10,<5
 numpy>=2.1,<3
 psutil>=6,<8
 cryptography>=44
+pywin32>=308; sys_platform == "win32"

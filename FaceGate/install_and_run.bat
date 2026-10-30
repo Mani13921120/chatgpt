@@ -19,13 +19,13 @@ if not exist ".venv\Scripts\python.exe" (
 )
 set "VPY=%PROJECT%\.venv\Scripts\python.exe"
 echo [3/6] Checking runtime libraries...
-"%VPY%" -c "import PySide6.QtWidgets, cv2, numpy, psutil, cryptography; print('Runtime imports OK')" >>"%LOG%" 2>&1
+"%VPY%" -c "import PySide6.QtWidgets, cv2, numpy, psutil, cryptography, win32file, win32security; print('Runtime imports OK')" >>"%LOG%" 2>&1
 if errorlevel 1 (
   echo Installing runtime packages. First run may take several minutes...
   >>"%LOG%" echo Installing runtime dependencies at %DATE% %TIME%
   "%VPY%" -m pip install --disable-pip-version-check --prefer-binary --no-warn-script-location -r requirements.txt >>"%LOG%" 2>&1
   if errorlevel 1 (echo ERROR: Package installation failed. See install_log.txt.& pause& exit /b 1)
-  "%VPY%" -c "import PySide6.QtWidgets, cv2, numpy, psutil, cryptography; print('Runtime imports OK after install')" >>"%LOG%" 2>&1
+  "%VPY%" -c "import PySide6.QtWidgets, cv2, numpy, psutil, cryptography, win32file, win32security; print('Runtime imports OK after install')" >>"%LOG%" 2>&1
   if errorlevel 1 (echo ERROR: Packages installed but imports still fail. See install_log.txt.& pause& exit /b 1)
 ) else (
   echo Runtime packages are ready.

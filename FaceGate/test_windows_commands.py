@@ -101,3 +101,50 @@ class WindowsCommandTests(unittest.TestCase):
 
     def test_powershell_remove_tree_is_denied(self):
         self.assert_delete_blocked('powershell', 'Remove-Item -LiteralPath $env:FG_SOURCE -Recurse -Force')
+
+    def test_cmd_rmdir_tree_stays_denied_after_handles_close(self):
+        self.assert_delete_blocked('cmd', 'rmdir /s /q "%FG_SOURCE%"', persistent=True)
+
+    def test_powershell_remove_known_file_stays_denied_after_handles_close(self):
+        self.assert_delete_blocked('powershell', "Remove-Item -LiteralPath (Join-Path $env:FG_SOURCE 'nested\\data.txt') -Force", persistent=True)
+
+    def test_empty_folder_cannot_be_removed_after_handles_close(self):
+        self.file.unlink()
+        self.file.parent.rmdir()
+        gate.engage(self.root, self.manifest)
+        gate.release(self.root)
+        result = self.command('cmd', 'rmdir /q "%FG_SOURCE%"', self.base / 'unused')
+        self.assertTrue(self.root.is_dir(), (result.stdout, result.stderr))
+        gate.disengage(self.root, self.manifest)
+        result = self.command('cmd', 'rmdir /q "%FG_SOURCE%"', self.base / 'unused')
+        self.assertFalse(self.root.exists(), (result.stdout, result.stderr))
+
+    def test_parent_guard_is_shared_and_survives_unlocking_one_sibling(self):
+        second = self.base / 'protected sibling'
+        second.mkdir()
+        second_manifest = self.base / 'second.json'
+        gate.engage(self.root, self.manifest)
+        try:
+            gate.engage(second, second_manifest)
+            gate.release(second)
+            gate.disengage(self.root, self.manifest)
+            with self.assertRaises(OSError):
+                second.rmdir()
+            # The unlocked sibling has its own DELETE right and remains usable.
+            moved = self.base / 'unlocked renamed'
+            self.root.rename(moved)
+            moved.rename(self.root)
+            gate.disengage(second, second_manifest)
+            second.rmdir()
+        finally:
+            if second.exists():
+                gate.disengage(second, second_manifest)
+
+    def test_all_original_acls_and_parent_acl_are_restored(self):
+        import windows_acl_policy as policy
+        paths = [self.base, self.root, self.file.parent, self.file]
+        original = {str(p): policy.dacl(p) for p in paths}
+        gate.engage(self.root, self.manifest)
+        gate.release(self.root)
+        gate.disengage(self.root, self.manifest)
+        self.assertEqual({str(p): policy.dacl(p) for p in paths}, original)

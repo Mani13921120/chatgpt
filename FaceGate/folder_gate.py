@@ -1,7 +1,7 @@
 """Windows folder gate: persistent root DACL plus live sharing locks.
 
-Not a kernel security boundary against the account owner/admin. Never modifies
-parent or child DACLs. Recovery metadata must remain outside the target folder.
+Applies reversible per-object DACLs and a shared parent deletion guard.
+Recovery metadata remains outside the selected folder.
 """
 import ctypes as C
 from ctypes import wintypes as W
@@ -9,12 +9,15 @@ import json
 import os
 from pathlib import Path
 import uuid
+import windows_acl_policy as policy
 
 _handles = {}
+_verified = set()
 DACL = 4
 FILE_READ_DATA = 0x0001  # FILE_LIST_DIRECTORY for directory handles
 DELETE = 0x00010000
 FILE_SHARE_ALL = 0x0007
+LOCK_ACCESS = FILE_READ_DATA | DELETE
 
 
 def _key(root):
@@ -26,6 +29,7 @@ def _key(root):
 def _api():
     if os.name != 'nt':
         raise RuntimeError('قفل خود پوشه فقط روی Windows و دیسک دارای ACL پشتیبانی می‌شود.')
+    policy.bindings()  # Check the native dependency before changing any data.
     k = C.WinDLL('kernel32', use_last_error=True)
     a = C.WinDLL('advapi32', use_last_error=True)
     k.CreateFileW.argtypes = [W.LPCWSTR, W.DWORD, W.DWORD, C.c_void_p, W.DWORD, W.DWORD, W.HANDLE]
@@ -88,11 +92,12 @@ def saved(root, manifest):
     value = json.loads(p.read_text(encoding='utf-8'))
     if not isinstance(value.get('root'), str) or _key(value['root']) != _key(root) or not isinstance(value.get('original_dacl'), str):
         raise RuntimeError('اطلاعات بازیابی مجوز پوشه نامعتبر است؛ هیچ مجوزی تغییر نکرد.')
+    policy.validate(value, root)
     return value
 
 
 def active(root):
-    return _key(root) in _handles
+    return _key(root) in _handles and _key(root) in _verified
 
 
 def _paths(root):
@@ -108,18 +113,18 @@ def _paths(root):
     return paths + [Path(root)]
 
 
-def acquire(root):
+def acquire(root, paths=None):
     """All handles or none; existing incompatible open files cause an error."""
-    if active(root):
+    if _key(root) in _handles:
         return
     k, _ = _api()
     handles = []
     try:
-        for path in _paths(root):
+        for path in (paths if paths is not None else _paths(root)):
             # A metadata-only READ_CONTROL handle does not participate in normal
             # data-access sharing checks. Request actual read/list access so that
             # share=0 enforces read/write/delete exclusion, including empty dirs.
-            h = k.CreateFileW(str(path), FILE_READ_DATA, 0, None, 3, 0x02000000, None)
+            h = k.CreateFileW(str(path), LOCK_ACCESS, 0, None, 3, 0x02000000, None)
             if h == C.c_void_p(-1).value:
                 raise C.WinError(C.get_last_error())
             handles.append(h)
@@ -130,24 +135,36 @@ def acquire(root):
         raise
 
 
-def verify_exclusion(root):
-    """Never report a lock if Windows still grants read/list or delete access.
-
-    Probes request handles only; they never read, copy, rename or delete data.
-    DELETE checks the parent-permission route too, unlike inspecting the root ACL.
-    """
+def _denied(path, accesses):
     k, _ = _api()
-    for access in (FILE_READ_DATA, DELETE):
-        h = k.CreateFileW(str(root), access, FILE_SHARE_ALL, None, 3, 0x02000000, None)
+    for access in accesses:
+        h = k.CreateFileW(str(path), access, FILE_SHARE_ALL, None, 3, 0x02000000, None)
         if h != C.c_void_p(-1).value:
             k.CloseHandle(h)
-            raise RuntimeError('ویندوز هنوز دسترسی خواندن یا حذف پوشه را می‌دهد؛ قفل کامل اعمال نشد.')
+            raise RuntimeError('ویندوز هنوز دسترسی خواندن، نوشتن یا حذف را می‌دهد؛ قفل کامل اعمال نشد: ' + str(path))
         error = C.get_last_error()
-        if error not in (5, 32):  # ACCESS_DENIED or SHARING_VIOLATION, not missing path/etc.
+        if error not in (5, 32):
             raise C.WinError(error)
 
 
+def verify_exclusion(root, paths=None):
+    """Non-destructive access probes; success is based on actual Windows denial."""
+    for path in (paths if paths is not None else [root]):
+        _denied(path, (FILE_READ_DATA, 0x2, DELETE))
+
+
+def verify_lock(root, manifest):
+    value = saved(root, manifest)
+    if not active(root) or not value or value.get('version') != 2 or value.get('state') != 'locked':
+        raise RuntimeError('قفل کامل و تأییدشده فعال نیست؛ قفل مجدد یا بازیابی لازم است.')
+    paths = [policy.relative_path(root, e['relative']) for e in value['entries']]
+    verify_exclusion(root, paths)
+    _denied(Path(root).parent, (policy.DELETE_CHILD,))
+    return sum(not e['directory'] for e in value['entries'])
+
+
 def release(root):
+    _verified.discard(_key(root))
     handles = _handles.pop(_key(root), [])
     if handles:
         k, _ = _api()
@@ -155,47 +172,55 @@ def release(root):
             k.CloseHandle(h)
 
 
+def _restore_existing(root, manifest, value):
+    if value.get('state') == 'unlocked':
+        return
+    if value.get('version') == 2:
+        policy.restore_tree(root, manifest, value)
+    else:
+        _set_dacl(root, value['original_dacl'])
+
+
 def engage(root, manifest):
-    """Save restoration data before restricting access. No success on partial lock."""
+    """Journal all original ACLs, apply tree/parent guards, then verify Windows."""
+    root = Path(os.path.realpath(os.path.abspath(root)))
     if active(root):
+        verify_lock(root, manifest)
         return
     value = saved(root, manifest)
-    # A previous process may have left the persistent DACL in place. Opening
-    # children requires restoring it first; ciphertext remains protected.
     if value:
-        _set_dacl(root, value['original_dacl'])
-    else:
-        original = _get_dacl(root)
-        if not original.startswith('D:') or '(' not in original:
-            raise RuntimeError('این پوشه DACL معمولی ندارد؛ برای جلوگیری از تغییر ناامن، قفل اعمال نشد.')
-        value = {'root': _key(root), 'original_dacl': original}
-        dest = sidecar(manifest)
-        temp = dest.with_name(dest.name + '.' + uuid.uuid4().hex)
-        try:
-            with temp.open('x', encoding='utf-8') as f:
-                json.dump(value, f)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(temp, dest)
-        finally:
-            temp.unlink(missing_ok=True)
-    try:
-        acquire(root)
-        original = value['original_dacl']
-        i = original.index('(')
-        # No inheritance: only the selected directory DACL changes. Preserve
-        # READ_CONTROL/WRITE_DAC for restoration by its owner.
-        _set_dacl(root, original[:i] + '(D;;0x00010047;;;WD)' + original[i:])
-        verify_exclusion(root)
-    except Exception:
+        _restore_existing(root, manifest, value)
         release(root)
-        _set_dacl(root, value['original_dacl'])
+    paths = _paths(root)
+    value = policy.snapshot(root, paths)
+    policy.write_journal(sidecar(manifest), value)
+    try:
+        acquire(root, paths)
+        policy.apply_tree(root, manifest, value)
+        verify_exclusion(root, paths)
+        _denied(root.parent, (policy.DELETE_CHILD,))
+        value['state'] = 'locked'
+        policy.write_journal(sidecar(manifest), value)
+        _verified.add(_key(root))
+    except Exception as exc:
+        try:
+            policy.restore_tree(root, manifest, value)
+            release(root)
+            value['state'] = 'unlocked'
+            policy.write_journal(sidecar(manifest), value)
+        except Exception as recovery:
+            # Keep remaining live handles and the durable original ACL journal.
+            # Never display a verified lock when rollback was incomplete.
+            _verified.discard(_key(root))
+            raise RuntimeError('قفل کامل نشد و بازیابی بعضی مجوزها نیازمند بررسی است. اطلاعات بازیابی را حذف نکن.\n' + str(recovery)) from exc
         raise
 
 
 def disengage(root, manifest):
-    """Caller MUST authenticate before calling this function."""
+    """Caller MUST authenticate before changing permissions or releasing handles."""
     value = saved(root, manifest)
     if value:
-        _set_dacl(root, value['original_dacl'])
+        _restore_existing(root, manifest, value)
+        value['state'] = 'unlocked'
+        policy.write_journal(sidecar(manifest), value)
     release(root)

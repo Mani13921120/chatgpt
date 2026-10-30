@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 echo Checking FaceGate Python dependencies...
-py -3.13 -c "import PySide6.QtNetwork, cv2, numpy, psutil, cryptography; print('Dependencies: OK')"
+py -3.13 -c "import PySide6.QtNetwork, cv2, numpy, psutil, cryptography, win32file, win32security; print('Dependencies: OK')"
 if errorlevel 1 goto failed
 echo Checking Python syntax...
 py -3.13 -m py_compile "%~dp0main.py" "%~dp0folder_inplace_crypto.py" "%~dp0vault_crypto.py" "%~dp0folder_gate.py" "%~dp0folder_auth.py" "%~dp0instance_bridge.py" "%~dp0explorer_integration.py" "%~dp0explorer_router.py"

@@ -22,7 +22,7 @@ class AuthenticationTests(unittest.TestCase):
                 try:
                     gate.acquire(d)
                     args = kernel.CreateFileW.call_args.args
-                    self.assertEqual(args[1], gate.FILE_READ_DATA)
+                    self.assertEqual(args[1], gate.LOCK_ACCESS)
                     self.assertEqual(args[2], 0)
                 finally:
                     gate.release(d)
@@ -36,16 +36,18 @@ class AuthenticationTests(unittest.TestCase):
         kernel.CloseHandle.assert_called_once_with(42)
 
     def test_failed_enforcement_probe_rolls_back_gate_and_reports_failure(self):
-        original = 'D:(A;;FA;;;WD)'
         with patch.object(gate, 'active', return_value=False), \
-             patch.object(gate, 'saved', return_value={'original_dacl': original}), \
-             patch.object(gate, '_set_dacl') as acl, \
+             patch.object(gate, 'saved', return_value=None), \
+             patch.object(gate, '_paths', return_value=[]), \
+             patch.object(gate.policy, 'snapshot', return_value={'state': 'locking'}), \
+             patch.object(gate.policy, 'write_journal'), patch.object(gate.policy, 'apply_tree'), \
+             patch.object(gate.policy, 'restore_tree') as restore, \
              patch.object(gate, 'acquire'), patch.object(gate, 'release') as release, \
              patch.object(gate, 'verify_exclusion', side_effect=RuntimeError('not blocked')):
             with self.assertRaisesRegex(RuntimeError, 'not blocked'):
                 gate.engage('folder', 'metadata')
-        release.assert_called_once_with('folder')
-        self.assertEqual(acl.call_args.args, ('folder', original))
+        release.assert_called_once()
+        restore.assert_called_once()
 
     def test_empty_folder_and_empty_subdirectories_support_full_lifecycle(self):
         import vault_crypto
@@ -254,6 +256,20 @@ class WindowsIntegrationTests(unittest.TestCase):
         self.assertTrue(gate.active(self.root))
         gate.disengage(self.root, self.mp)
         self.assertEqual(gate._get_dacl(self.root), self.original)
+
+    def test_legacy_root_only_journal_upgrades_to_recursive_protection(self):
+        import json
+        legacy = {'root': gate._key(self.root), 'original_dacl': self.original}
+        gate.sidecar(self.mp).write_text(json.dumps(legacy), encoding='utf-8')
+        offset = self.original.index('(')
+        gate._set_dacl(self.root, self.original[:offset] + '(D;;0x00010047;;;WD)' + self.original[offset:])
+        gate.engage(self.root, self.mp)
+        self.assertEqual(gate.saved(self.root, self.mp)['version'], 2)
+        gate.release(self.root)
+        with self.assertRaises(OSError):
+            (self.root / 'nested' / 'data.txt').read_bytes()
+        gate.disengage(self.root, self.mp)
+        self.assertEqual((self.root / 'nested' / 'data.txt').read_text(), 'original data')
 
 
 if __name__ == '__main__':

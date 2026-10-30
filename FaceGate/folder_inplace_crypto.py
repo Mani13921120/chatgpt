@@ -203,6 +203,8 @@ def walk_regular_files(folder: str | Path) -> list[Path]:
             if _path_is_link(p):
                 raise RuntimeError(f"برای جلوگیری از تغییر مسیر ناخواسته، junction/symlink پشتیبانی نمی‌شود:\n{p}")
             if p.is_file() and not is_encrypted_file(p):
+                if p.stat().st_nlink > 1:
+                    raise RuntimeError(f'برای جلوگیری از باقی ماندن مسیر جایگزین خوانا، فایل دارای hard link پشتیبانی نمی‌شود:\n{p}')
                 result.append(p)
     return result
 
@@ -663,8 +665,9 @@ def lock_folder_in_place(folder, metadata_root, pin=None, manifest=None):
         meta = read_manifest(mp)
         if not meta or meta.get('state') != 'locked':
             raise RuntimeError('وضعیت قفل پوشه ناسازگار است؛ بازیابی لازم است.')
+        count = folder_gate.verify_lock(folder, mp)
         return {'root': str(folder), 'manifest_path': str(mp), 'state': 'locked',
-                'file_count': None, 'warning': ''}
+                'file_count': count, 'warning': ''}
     folder_gate._api()
     has_gate = folder_gate.saved(folder, mp) is not None
     if has_gate:
