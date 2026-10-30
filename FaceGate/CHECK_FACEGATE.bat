@@ -2,10 +2,10 @@
 setlocal
 cd /d "%~dp0"
 echo Checking FaceGate Python dependencies...
-py -3.13 -c "import PySide6.QtNetwork, cv2, numpy, psutil, cryptography, win32file, win32security; print('Dependencies: OK')"
+"%~dp0.venv\Scripts\python.exe" -c "import PySide6.QtNetwork, cv2, numpy, psutil, cryptography, win32file, win32security; print('Dependencies: OK')"
 if errorlevel 1 goto failed
 echo Checking Python syntax...
-py -3.13 -m py_compile "%~dp0main.py" "%~dp0folder_inplace_crypto.py" "%~dp0vault_crypto.py" "%~dp0folder_gate.py" "%~dp0folder_auth.py" "%~dp0instance_bridge.py" "%~dp0explorer_integration.py" "%~dp0explorer_router.py"
+"%~dp0.venv\Scripts\python.exe" -m py_compile "%~dp0main.py" "%~dp0folder_inplace_crypto.py" "%~dp0vault_crypto.py" "%~dp0folder_gate.py" "%~dp0folder_auth.py" "%~dp0instance_bridge.py" "%~dp0explorer_integration.py" "%~dp0explorer_router.py"
 if errorlevel 1 goto failed
 echo Checking face models...
 if not exist "%~dp0models\face_detection_yunet_2023mar.onnx" echo MISSING: models\face_detection_yunet_2023mar.onnx

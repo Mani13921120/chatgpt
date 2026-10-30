@@ -10,7 +10,7 @@ from pathlib import Path, PureWindowsPath
 import sqlite3
 import threading
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager
 
 _LOCK = threading.RLock()
 READ_CONTROL = 0x20000
@@ -37,10 +37,15 @@ def key(path):
     return os.path.normcase(os.path.realpath(os.path.abspath(path)))
 
 
+@contextmanager
 def metadata_handle(path, write=False):
     file, _ = bindings()
     access = READ_CONTROL | READ_ATTRIBUTES | (WRITE_DAC if write else 0)
-    return file.CreateFile(str(path), access, 7, None, 3, 0x02000000 | 0x00200000, None)
+    handle = file.CreateFile(str(path), access, 7, None, 3, 0x02000000 | 0x00200000, None)
+    try:
+        yield handle
+    finally:
+        handle.Close()
 
 
 def information(handle):

@@ -18,7 +18,7 @@ def main():
         raise SystemExit('Windows validation requires real Windows, not mocks.')
     administrator = bool(ctypes.windll.shell32.IsUserAnAdmin())
     print(f'Administrator token: {administrator}', flush=True)
-    suite = unittest.defaultTestLoader.loadTestsFromNames(['test_folder_gate', 'test_windows_commands'])
+    suite = unittest.defaultTestLoader.loadTestsFromNames(['test_folder_gate', 'test_windows_commands', 'test_acl_policy'])
     report = io.StringIO()
     result = unittest.TextTestRunner(stream=report, verbosity=2).run(suite)
     print(report.getvalue(), flush=True)
