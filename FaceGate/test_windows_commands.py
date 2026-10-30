@@ -32,7 +32,11 @@ class WindowsCommandTests(unittest.TestCase):
     def command(self, kind, command, target):
         environment = dict(os.environ, FG_SOURCE=str(self.root), FG_TARGET=str(target))
         if kind == 'cmd':
-            args = [os.environ.get('COMSPEC', 'cmd.exe'), '/d', '/c', command]
+            # list2cmdline escapes embedded quotes for C runtimes, not CMD.
+            # A batch file preserves CMD's actual quoting and variable expansion.
+            script = self.base / 'operation.cmd'
+            script.write_bytes(('@echo off\r\n' + command + '\r\nexit /b %errorlevel%\r\n').encode('ascii'))
+            args = [os.environ.get('COMSPEC', 'cmd.exe'), '/d', '/c', str(script)]
         else:
             args = ['powershell.exe', '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', "$ErrorActionPreference='Stop'; " + command]
         return subprocess.run(args, env=environment, capture_output=True, timeout=30)

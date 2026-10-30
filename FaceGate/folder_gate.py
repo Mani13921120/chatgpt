@@ -18,7 +18,9 @@ FILE_SHARE_ALL = 0x0007
 
 
 def _key(root):
-    return os.path.normcase(os.path.abspath(root))
+    # Windows TEMP, shortcuts and callers can use an 8.3 alias for a path that
+    # Path.resolve() elsewhere expands to its long name. Use one identity form.
+    return os.path.normcase(os.path.realpath(os.path.abspath(root)))
 
 
 def _api():
@@ -84,7 +86,7 @@ def saved(root, manifest):
     if not p.exists():
         return None
     value = json.loads(p.read_text(encoding='utf-8'))
-    if value.get('root') != _key(root) or not isinstance(value.get('original_dacl'), str):
+    if not isinstance(value.get('root'), str) or _key(value['root']) != _key(root) or not isinstance(value.get('original_dacl'), str):
         raise RuntimeError('اطلاعات بازیابی مجوز پوشه نامعتبر است؛ هیچ مجوزی تغییر نکرد.')
     return value
 
