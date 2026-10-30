@@ -97,6 +97,17 @@ class FolderUiTests(unittest.TestCase):
         protect.assert_not_called()
         self.assertEqual([p.name for p in self.root.iterdir()], ['sample.txt'])
 
+    def test_existing_path_alias_resolves_to_stored_database_record(self):
+        alias = str(self.root.parent / 'SELECT~1')
+        actual_key = self.main.inplace_crypto.folder_gate._key
+        expected = actual_key(self.root)
+        def canonical(path):
+            return expected if str(path) == alias else actual_key(path)
+        with patch.object(self.main.inplace_crypto.folder_gate, '_key', side_effect=canonical):
+            record = self.win._folder_record(alias)
+        self.assertIsNotNone(record)
+        self.assertEqual(record['path'], str(self.root))
+
     def test_camera_times_out_without_frames_and_never_unlocks(self):
         with patch.object(self.win, 'start_camera', self._start_camera), \
              patch.object(QMessageBox, 'exec', lambda box: self._dismiss(box)), \

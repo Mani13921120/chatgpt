@@ -276,7 +276,8 @@ def _replace_content(temp: Path, original: Path):
     from windows_acl_policy import dacl, identity, set_dacl
     # A freshly created temp file has inherited permissions, which may differ
     # from an original's explicit/protected ACL. Preserve those flags as well.
-    set_dacl(temp, dacl(original), identity(temp))
+    original_acl = dacl(original)
+    set_dacl(temp, original_acl, identity(temp))
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
     replace = kernel.ReplaceFileW
     replace.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR,
@@ -285,6 +286,9 @@ def _replace_content(temp: Path, original: Path):
     # No IGNORE_MERGE_ERRORS fallback: a security/stream merge failure is an error.
     if not replace(str(original), str(temp), None, 0, None, None):
         raise ctypes.WinError(ctypes.get_last_error())
+    # ReplaceFile may add SE_DACL_AUTO_INHERITED even to a protected DACL.
+    # Restore the recorded control flags as well as the unchanged ACE contents.
+    set_dacl(original, original_acl, identity(original))
 
 
 def encrypt_file_in_place(path: str | Path, key: bytes, envelope: dict) -> bool:

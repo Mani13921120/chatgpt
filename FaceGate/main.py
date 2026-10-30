@@ -623,6 +623,14 @@ class FaceGate(QMainWindow):
                 # case-insensitive fallback for existing records on Windows
                 row = con.execute('SELECT path, display_name, acl_backup_path, is_locked FROM protected_folders WHERE lower(path)=lower(?)',
                                   (str(Path(folder_path).resolve()),)).fetchone()
+            if not row:
+                # Legacy rows may contain Windows 8.3 or junction aliases. Keep
+                # the stored spelling for SQL updates, but compare real paths.
+                wanted = inplace_crypto.folder_gate._key(folder_path)
+                for candidate in con.execute('SELECT path, display_name, acl_backup_path, is_locked FROM protected_folders'):
+                    if inplace_crypto.folder_gate._key(candidate[0]) == wanted:
+                        row = candidate
+                        break
             return {'path': row[0], 'name': row[1], 'backup': row[2], 'locked': bool(row[3])} if row else None
         finally:
             con.close()
@@ -632,7 +640,7 @@ class FaceGate(QMainWindow):
         root = self._metadata_root()
         con = db()
         try:
-            registered = {str(row[0]).casefold() for row in con.execute('SELECT path FROM protected_folders').fetchall()}
+            registered = {inplace_crypto.folder_gate._key(row[0]) for row in con.execute('SELECT path FROM protected_folders').fetchall()}
         finally:
             con.close()
         for mp in root.glob('*.json'):
@@ -641,7 +649,7 @@ class FaceGate(QMainWindow):
                 continue
             try:
                 folder = Path(meta.get('root', '')).resolve()
-                if not folder.is_dir() or str(folder).casefold() in registered:
+                if not folder.is_dir() or inplace_crypto.folder_gate._key(folder) in registered:
                     continue
                 # Do not register arbitrary unused metadata unless some ciphertext remains
                 # or the manifest explicitly says an operation was interrupted/open.
@@ -657,7 +665,7 @@ class FaceGate(QMainWindow):
                         con.commit()
                     finally:
                         con.close()
-                    registered.add(str(folder).casefold())
+                    registered.add(inplace_crypto.folder_gate._key(folder))
             except Exception:
                 continue
 
@@ -1345,7 +1353,12 @@ foreach ($entry in $rows) {
             # SQLite is touched only after decryption, ACL restoration and retirement.
             con = db()
             try:
-                con.execute('DELETE FROM protected_folders WHERE path=?', (record['path'],))
+                root_key = inplace_crypto.folder_gate._key(record['path'])
+                metadata_key = inplace_crypto.folder_gate._key(record['backup'])
+                aliases = [row[0] for row in con.execute('SELECT path, acl_backup_path FROM protected_folders')
+                           if inplace_crypto.folder_gate._key(row[0]) == root_key
+                           and inplace_crypto.folder_gate._key(row[1]) == metadata_key]
+                con.executemany('DELETE FROM protected_folders WHERE path=?', [(path,) for path in aliases])
                 con.commit()
             finally:
                 con.close()
