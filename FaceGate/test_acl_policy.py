@@ -31,4 +31,5 @@ class AclPolicySafetyTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 policy.set_dacl('selected', 'D:(A;;FA;;;WD)', [99, 99, 99])
         security.SetSecurityInfo.assert_not_called()
+        security.SetKernelObjectSecurity.assert_not_called()
         file.CreateFile.return_value.Close.assert_called_once()

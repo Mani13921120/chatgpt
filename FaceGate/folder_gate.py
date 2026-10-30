@@ -194,8 +194,10 @@ def engage(root, manifest):
     paths = _paths(root)
     value = policy.snapshot(root, paths)
     policy.write_journal(sidecar(manifest), value)
+    changed_permissions = False
     try:
         acquire(root, paths)
+        changed_permissions = True
         policy.apply_tree(root, manifest, value)
         verify_exclusion(root, paths)
         _denied(root.parent, (policy.DELETE_CHILD,))
@@ -204,7 +206,8 @@ def engage(root, manifest):
         _verified.add(_key(root))
     except Exception as exc:
         try:
-            policy.restore_tree(root, manifest, value)
+            if changed_permissions:
+                policy.restore_tree(root, manifest, value)
             release(root)
             value['state'] = 'unlocked'
             policy.write_journal(sidecar(manifest), value)

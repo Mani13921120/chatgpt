@@ -53,7 +53,7 @@ def information(handle):
     info = file.GetFileInformationByHandle(handle)
     if info[0] & REPARSE_POINT:
         raise RuntimeError('مسیر به junction/symlink تغییر کرده است؛ مجوزی تغییر نکرد.')
-    return [int(info[4]), int(info[-2]), int(info[-1])], bool(info[0] & 0x10)
+    return [int(n) & 0xffffffff for n in (info[4], info[-2], info[-1])], bool(info[0] & 0x10)
 
 
 def identity(path):
@@ -65,7 +65,7 @@ def dacl(path):
     _, security = bindings()
     with metadata_handle(path) as handle:
         information(handle)
-        sd = security.GetSecurityInfo(handle, security.SE_FILE_OBJECT, security.DACL_SECURITY_INFORMATION)
+        sd = security.GetKernelObjectSecurity(handle, security.DACL_SECURITY_INFORMATION)
     return security.ConvertSecurityDescriptorToStringSecurityDescriptor(sd, 1, security.DACL_SECURITY_INFORMATION)
 
 
@@ -78,8 +78,14 @@ def set_dacl(path, value, expected_identity):
         actual, _ = information(handle)
         if actual != expected_identity:
             raise RuntimeError('هویت فایل یا پوشه تغییر کرده است؛ برای جلوگیری از تغییر مجوز مسیر اشتباه، عملیات متوقف شد.')
-        security.SetSecurityInfo(handle, security.SE_FILE_OBJECT, security.DACL_SECURITY_INFORMATION | protection,
-                                 None, None, sd.GetSecurityDescriptorDacl(), None)
+        flags = security.DACL_SECURITY_INFORMATION | protection
+        # pywin32 parses SECURITY_INFORMATION as a signed Windows LONG, although
+        # the native bitmask is unsigned. Preserve the high protection bit.
+        if flags >= 0x80000000:
+            flags -= 0x100000000
+        # Set the complete descriptor on the validated handle. SetSecurityInfo
+        # re-evaluates inheritance and can change originally explicit ACEs.
+        security.SetKernelObjectSecurity(handle, flags, sd)
 
 
 def relative_path(root, relative):
@@ -140,7 +146,7 @@ def snapshot(root, paths):
             file, security = bindings()
             if not directory and file.GetFileInformationByHandle(handle)[7] > 1:
                 raise RuntimeError('فایل دارای hard link است؛ مجوز مسیرهای خارج از پوشه تغییر داده نمی‌شود.')
-            sd = security.GetSecurityInfo(handle, security.SE_FILE_OBJECT, security.DACL_SECURITY_INFORMATION)
+            sd = security.GetKernelObjectSecurity(handle, security.DACL_SECURITY_INFORMATION)
             acl = security.ConvertSecurityDescriptorToStringSecurityDescriptor(sd, 1, security.DACL_SECURITY_INFORMATION)
         if not acl.startswith('D:') or '(' not in acl:
             raise RuntimeError('قفل پوشه با مجوز خالی/نامحدود پشتیبانی نمی‌شود؛ هیچ مجوزی تغییر نکرد.')
