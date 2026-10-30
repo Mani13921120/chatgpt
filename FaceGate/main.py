@@ -36,6 +36,10 @@ if __name__ == '__main__' and '--explorer-open' in sys.argv:
 import psutil
 import folder_inplace_crypto as inplace_crypto
 import explorer_integration
+import app_catalog
+import app_runtime
+import threading
+from collections import deque
 from folder_auth import FOLDER_AUTH_SECONDS, FolderFaceAttempt
 from instance_bridge import InstanceServer, forward_request, instance_name
 from ctypes import wintypes
@@ -112,6 +116,7 @@ def db():
     con = sqlite3.connect(DB_PATH)
     con.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)')
     con.execute('CREATE TABLE IF NOT EXISTS locked_apps (path TEXT PRIMARY KEY COLLATE NOCASE, display_name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1)')
+    app_runtime.ensure_schema(con)
     con.execute('CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
     con.execute('CREATE TABLE IF NOT EXISTS protected_folders (path TEXT PRIMARY KEY COLLATE NOCASE, display_name TEXT NOT NULL, acl_backup_path TEXT NOT NULL, is_locked INTEGER NOT NULL DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP)')
     con.commit()
@@ -185,6 +190,21 @@ class FaceTrainingWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class AppInventoryWorker(QThread):
+    loaded = Signal(object, object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.cancelled = threading.Event()
+
+    def run(self):
+        try:
+            apps, warnings = app_catalog.discover(self.cancelled)
+            self.loaded.emit(apps, warnings)
+        except Exception as exc:
+            self.loaded.emit([], [str(exc)])
+
+
 class FaceGate(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -210,6 +230,13 @@ class FaceGate(QMainWindow):
         # Keep an app authorized for its whole running session, including child/helper processes.
         self._authorized_app_sessions = set()
         self._authorized_session_last_seen = {}
+        self._app_targets = {}
+        self._app_sessions = app_runtime.Sessions()
+        self._app_identity_cache = {}
+        self._app_gate_queue = deque()
+        self._inventory_jobs = []
+        QApplication.instance().aboutToQuit.connect(self._stop_inventory_jobs)
+        self._app_scan_active = False
         self._allow_next_foreground = {}
         self._last_foreground_key = None
         self._last_gate_event = 0.0
@@ -1842,6 +1869,8 @@ foreach ($entry in $rows) {
         QApplication.quit()
 
     def set_backup_password(self):
+        if not self._require_management_password('تأیید تغییر رمز پشتیبان برنامه‌ها'):
+            return
         first, ok = QInputDialog.getText(self, 'رمز پشتیبان', 'رمز پشتیبان جدید را وارد کنید (حداقل 8 نویسه):', QLineEdit.Password)
         if not ok:
             return
@@ -1892,46 +1921,40 @@ foreach ($entry in $rows) {
 
     def _launch_pending_app(self, pending):
         key = pending['key']
+        app = self._app_targets.get(key)
+        if app is None:
+            self.status.setText('این برنامه دیگر در فهرست محافظت نیست؛ درخواست لغو شد.')
+            return
+        self._app_sessions.grant(key)
         try:
-            # Face auth grants one session for this app path; switching/minimizing or
-            # creating documents won't re-prompt while any instance of the app is alive.
-            normalized_exe = str(Path(pending['exe']).resolve()).lower()
-            self._authorized_app_sessions.add(normalized_exe)
-            self._authorized_app_sessions.add(Path(normalized_exe).name.casefold())
-            now = time.time()
-            self._authorized_session_last_seen[normalized_exe] = now
-            self._authorized_session_last_seen[Path(normalized_exe).name.casefold()] = now
-            # If a protected app window was already open, restore it only after auth.
             hwnd = int(pending.get('hwnd') or 0)
-            if hwnd and os.name == 'nt' and ctypes.windll.user32.IsWindow(hwnd):
-                ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-                ctypes.windll.user32.SetForegroundWindow(hwnd)
+            if hwnd and app_runtime.window_pid(hwnd, True) == pending.get('pid'):
+                app_runtime.show_window(hwnd, True)
             else:
-                child = subprocess.Popen(pending['command'], cwd=str(Path(pending['exe']).parent), close_fds=True)
-                self._authorized_launches[key] = time.time() + 3
-                self._allow_next_foreground[key] = time.time() + 3
-            # Release the webcam immediately. Keep only the background monitor alive,
-            # so the next protected-app launch can trigger a fresh authentication.
-            self.stop_camera()
-            self.mode = 'idle'
-            self._pending_app_unlock = None
-            self._gate_active = False
-            self.status.setText(f'احراز هویت موفق؛ «{pending["name"]}» باز شد. دوربین خاموش شد.')
+                app_runtime.launch(app, pending.get('command'), pending.get('cwd'))
+            self.stop_camera(); self.mode = 'idle'
+            self._pending_app_unlock = None; self._gate_active = False
+            self.status.setText(f'احراز هویت موفق؛ «{app.name}» باز شد.')
             self.hide()
-        except Exception as launch_error:
-            self.status.setText(f'احراز هویت موفق بود، اما اجرای برنامه ناموفق بود: {launch_error}')
+        except Exception as exc:
+            self._app_sessions.revoke(key)
+            self._pending_app_unlock = None; self.mode = 'idle'; self._gate_active = False
             self.stop_camera()
+            self.status.setText(f'اجرای «{app.name}» ناموفق بود؛ مجوز موقت لغو شد: {exc}')
 
     def load_locked_apps(self):
         if not hasattr(self, 'app_list'):
             return
         self.app_list.clear()
         con = db()
+        self._app_targets = app_runtime.load_apps(con)
+        self._known_processes = {(p.info['pid'], p.info.get('create_time')) for p in psutil.process_iter(['pid','create_time'], ad_value=None)}
         rows = sorted(con.execute('SELECT path, display_name, enabled FROM locked_apps').fetchall(), key=lambda row: row[1].casefold())
         con.close()
         icon_provider = QFileIconProvider()
         for path, name, enabled in rows:
-            item = QListWidgetItem(('🔒  ' if enabled else '○  ') + name)
+            supported = path in self._app_targets
+            item = QListWidgetItem(('🔒  ' if enabled and supported else '⚠  ' if enabled else '○  ') + name)
             item.setData(Qt.UserRole, path)  # internal only; never displayed
             try:
                 item.setIcon(icon_provider.icon(QFileInfo(path)))
@@ -1940,119 +1963,87 @@ foreach ($entry in $rows) {
             self.app_list.addItem(item)
 
     def _discover_installed_apps(self):
-        """Return installed desktop apps from Windows uninstall registry entries."""
-        found = {}
-        if os.name != 'nt':
-            return found
-        try:
-            import winreg
-            roots = [
-                (winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'),
-                (winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'),
-                (winreg.HKEY_CURRENT_USER, r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'),
-            ]
-            for hive, subkey in roots:
-                try: parent = winreg.OpenKey(hive, subkey)
-                except OSError: continue
-                with parent:
-                    for i in range(winreg.QueryInfoKey(parent)[0]):
-                        try:
-                            child_name = winreg.EnumKey(parent, i)
-                            with winreg.OpenKey(parent, child_name) as child:
-                                vals = {}
-                                for name in ('DisplayName','DisplayIcon','InstallLocation','UninstallString'):
-                                    try: vals[name] = winreg.QueryValueEx(child, name)[0]
-                                    except OSError: pass
-                            display = str(vals.get('DisplayName','')).strip()
-                            icon = str(vals.get('DisplayIcon','')).strip().strip('"')
-                            if ',' in icon and icon.rsplit(',',1)[-1].strip('-').isdigit(): icon = icon.rsplit(',',1)[0].strip('"')
-                            candidate = Path(os.path.expandvars(icon)) if icon else None
-                            if candidate and candidate.is_file() and candidate.suffix.lower()=='.exe' and display:
-                                found[str(candidate.resolve()).lower()] = (display, str(candidate.resolve()))
-                        except (OSError, ValueError): continue
-        except Exception:
-            pass
-        # Resolve Start Menu shortcuts (.lnk) through Windows Script Host so apps
-        # such as Edge/Chrome appear even when the shortcut itself is not an EXE.
-        if os.name == 'nt':
-            try:
-                roots = [Path(os.getenv('APPDATA',''))/'Microsoft/Windows/Start Menu',
-                         Path(os.getenv('PROGRAMDATA',''))/'Microsoft/Windows/Start Menu',
-                         Path(os.getenv('USERPROFILE',''))/'Desktop',
-                         Path(os.getenv('PUBLIC',r'C:\\Users\\Public'))/'Desktop']
-                ps = r'''$ErrorActionPreference='SilentlyContinue'; $w=New-Object -ComObject WScript.Shell; Get-ChildItem -LiteralPath $env:FACEGATE_SCAN_ROOT -Filter *.lnk -Recurse -Force | ForEach-Object { $s=$w.CreateShortcut($_.FullName); if ($s.TargetPath) { [PSCustomObject]@{Name=$_.BaseName;Target=$s.TargetPath} } } | ConvertTo-Json -Compress'''
-                import json
-                for root in roots:
-                    if not root.exists(): continue
-                    env = os.environ.copy()
-                    env['FACEGATE_SCAN_ROOT'] = str(root)
-                    run = subprocess.run(['powershell.exe','-NoLogo','-NoProfile','-NonInteractive','-Command',ps],
-                                         env=env, capture_output=True, text=True, timeout=30, creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
-                    if run.returncode == 0 and run.stdout.strip():
-                        data = json.loads(run.stdout)
-                        if isinstance(data, dict): data = [data]
-                        for entry in data:
-                            target = str(Path(entry.get('Target','')).resolve())
-                            if target.lower().endswith('.exe') and Path(target).is_file():
-                                found[target.lower()] = (entry.get('Name') or Path(target).stem, target)
-            except Exception:
-                pass
-        # Also include common app executables from Start Menu's Programs folder.
-        try:
-            roots = [Path(os.getenv('APPDATA',''))/'Microsoft/Windows/Start Menu', Path(os.getenv('PROGRAMDATA',''))/'Microsoft/Windows/Start Menu', Path(os.getenv('USERPROFILE',''))/'Desktop', Path(os.getenv('PUBLIC',r'C:\\Users\\Public'))/'Desktop']
-            for root in roots:
-                if not root.exists(): continue
-                for exe in root.rglob('*.exe'):
-                    if exe.is_file(): found.setdefault(str(exe.resolve()).lower(), (exe.stem, str(exe.resolve())))
-        except Exception: pass
-        return found
+        return app_catalog.discover()
+
+    def _stop_inventory_jobs(self):
+        for worker in list(self._inventory_jobs):worker.cancelled.set()
+        for worker in list(self._inventory_jobs):worker.wait(6000)
 
     def add_locked_app(self):
-        if not self._require_management_password('تأیید افزودن برنامه محافظت‌شده'): return
-        apps = self._discover_installed_apps()
-        dialog = QDialog(self); dialog.setWindowTitle('انتخاب برنامه‌ها — شبیه منوی Start'); dialog.resize(650, 650)
+        if not self._require_management_password('تأیید افزودن برنامه محافظت‌شده'):
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle('همهٔ برنامه‌ها — Start ویندوز')
+        dialog.resize(650, 680)
         layout = QVBoxLayout(dialog)
-        hint = QLabel('برنامه‌ها را بر اساس نام پیدا کن و انتخاب کن. فقط نام و نماد نمایش داده می‌شود؛ مسیرها پنهان هستند.'); hint.setWordWrap(True); layout.addWidget(hint)
-        search = QLineEdit(); search.setPlaceholderText('جست‌وجوی برنامه‌ها…'); layout.addWidget(search)
-        listing = QListWidget(); listing.setSelectionMode(QAbstractItemView.ExtendedSelection); listing.setIconSize(QSize(32, 32)); listing.setSpacing(3)
-        listing.setStyleSheet('QListWidget {background:#f7f7f7;color:#171717;border:0;border-radius:10px;padding:8px;} QListWidget::item {padding:10px 8px; min-height:34px;} QListWidget::item:selected {background:#dceafe;color:#111;} QListWidget::item:hover {background:#eaeaea;}')
-        layout.addWidget(listing, 1)
-        items = sorted(apps.values(), key=lambda x: x[0].casefold())
-        icon_provider = QFileIconProvider()
-        for name, path in items:
-            item = QListWidgetItem(name); item.setData(Qt.UserRole, path); item.setData(Qt.UserRole + 1, name)
-            try: item.setIcon(icon_provider.icon(QFileInfo(path)))
-            except Exception: pass
-            listing.addItem(item)
-        def filter_items(text):
-            needle = text.casefold().strip()
-            for i in range(listing.count()):
-                item = listing.item(i); item.setHidden(needle not in item.text().casefold())
-        search.textChanged.connect(filter_items)
+        search = QLineEdit(); search.setPlaceholderText('جست‌وجو در همهٔ برنامه‌ها…'); layout.addWidget(search)
+        status = QLabel('در حال دریافت فهرست از ویندوز…'); status.setWordWrap(True); layout.addWidget(status)
+        listing = QListWidget(); listing.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        listing.setIconSize(QSize(32,32)); listing.setSpacing(2)
+        listing.setStyleSheet('QListWidget {background:#f7f7f7;color:#171717;border:0;border-radius:12px;padding:8px;} QListWidget::item {padding:10px 8px;min-height:34px;} QListWidget::item:selected {background:#dceafe;color:#111;} QListWidget::item:hover {background:#eaeaea;}')
+        layout.addWidget(listing,1)
+        refresh = QPushButton('تازه‌سازی فهرست'); layout.addWidget(refresh)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText('تأیید انتخاب')
-        buttons.button(QDialogButtonBox.Cancel).setText('لغو')
+        buttons.button(QDialogButtonBox.Ok).setText('افزودن انتخاب‌ها')
+        buttons.button(QDialogButtonBox.Ok).setEnabled(False)
+        buttons.button(QDialogButtonBox.Cancel).setText('انصراف')
         buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject); layout.addWidget(buttons)
-        if not items:
-            QMessageBox.information(self, 'برنامه‌ها پیدا نشدند', 'از فهرست فایل‌های EXE استفاده کنید.');
-            paths, _ = QFileDialog.getOpenFileNames(self, 'انتخاب چند فایل اجرایی', str(Path.home()), 'برنامه‌های ویندوز (*.exe)')
-        else:
-            if dialog.exec() != QDialog.Accepted: return
-            paths = [listing.item(i).data(Qt.UserRole) for i in range(listing.count()) if listing.item(i).isSelected()]
-            if not paths: return
+        state = {'worker': None, 'apps': {}, 'closed': False}
+        def filter_items(text):
+            needle = app_catalog.search_key(text)
+            for i in range(listing.count()):
+                item = listing.item(i)
+                item.setHidden(needle not in app_catalog.search_key(item.text()))
+        search.textChanged.connect(filter_items)
+        def loaded(apps, warnings):
+            if state['closed'] or not dialog.isVisible(): return
+            selected = {item.data(Qt.UserRole) for item in listing.selectedItems()}
+            listing.clear(); state['apps'] = {app.key:app for app in apps}
+            icons = QFileIconProvider()
+            for app in apps:
+                item = QListWidgetItem(app.name); item.setData(Qt.UserRole,app.key)
+                if app.executable:
+                    item.setIcon(icons.icon(QFileInfo(app.executable)))
+                else:
+                    item.setIcon(QApplication.style().standardIcon(QStyle.SP_DesktopIcon))
+                if not app.monitorable:
+                    item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
+                    item.setToolTip('این مورد میزبان مستقل قابل پایش ندارد؛ در صورت داشتن فایل اجرایی از انتخاب EXE استفاده کن.')
+                listing.addItem(item)
+                if app.key in selected: item.setSelected(True)
+            filter_items(search.text())
+            status.setText(f'{len(apps)} برنامه از فهرست ویندوز' + (' — بخشی از فهرست دریافت نشد؛ دوباره تازه‌سازی کن.' if warnings else ''))
+            refresh.setEnabled(True)
+            buttons.button(QDialogButtonBox.Ok).setEnabled(bool(apps))
+        def start_scan():
+            refresh.setEnabled(False); status.setText('در حال دریافت فهرست از ویندوز…')
+            worker = AppInventoryWorker(self); state['worker'] = worker
+            self._inventory_jobs.append(worker)
+            worker.loaded.connect(loaded)
+            def retire(w=worker):
+                if state['worker'] is w: state['worker'] = None
+                if w in self._inventory_jobs: self._inventory_jobs.remove(w)
+                w.deleteLater()
+            worker.finished.connect(retire)
+            worker.start()
+        refresh.clicked.connect(start_scan)
+        QTimer.singleShot(0,start_scan)
+        accepted = dialog.exec() == QDialog.Accepted
+        state['closed'] = True
+        selected = [state['apps'][item.data(Qt.UserRole)] for item in listing.selectedItems()
+                    if item.data(Qt.UserRole) in state['apps'] and state['apps'][item.data(Qt.UserRole)].monitorable]
+        worker = state['worker']
+        if worker and worker.isRunning(): worker.cancelled.set()
+        dialog.deleteLater()
+        if not accepted: return
+        if not selected: return
         con = db()
         try:
-            if items:
-                selected = [(listing.item(i).data(Qt.UserRole), listing.item(i).data(Qt.UserRole + 1)) for i in range(listing.count()) if listing.item(i).isSelected()]
-            else:
-                selected = [(path, Path(path).stem) for path in paths]
-            for path, name in selected:
-                path = str(Path(path).resolve())
-                con.execute('INSERT INTO locked_apps(path, display_name, enabled) VALUES(?,?,1) ON CONFLICT(path) DO UPDATE SET display_name=excluded.display_name, enabled=1', (path, name or Path(path).stem))
+            for app in selected: app_runtime.save_app(con,app)
             con.commit()
         finally: con.close()
         self.load_locked_apps()
-        self.status.setText(f'{len(paths)} برنامه به فهرست محافظت اضافه شد.')
+        self.status.setText(f'{len(selected)} برنامه به فهرست محافظت اضافه شد.')
 
     def add_locked_app_by_path(self):
         """Manually choose one or more EXE paths when Start-menu discovery misses an app."""
@@ -2075,11 +2066,9 @@ foreach ($entry in $rows) {
                         continue
                     # Use the executable filename as the default display name; keep the full
                     # canonical path as the identity used by the monitor.
-                    con.execute(
-                        'INSERT INTO locked_apps(path, display_name, enabled) VALUES(?,?,1) '
-                        'ON CONFLICT(path) DO UPDATE SET display_name=excluded.display_name, enabled=1',
-                        (str(exe_path), exe_path.stem)
-                    )
+                    app = app_catalog.App.desktop(str(exe_path))
+                    if not app.monitorable: continue
+                    app_runtime.save_app(con, app)
                     added += 1
                 except (OSError, ValueError):
                     continue
@@ -2104,6 +2093,8 @@ foreach ($entry in $rows) {
             for item in items:
                 path = item.data(Qt.UserRole)
                 con.execute('DELETE FROM locked_apps WHERE path=?', (path,))
+                con.execute('DELETE FROM locked_app_details WHERE path=?', (path,))
+                self._app_sessions.revoke(path)
                 self._app_unlock_until.pop(path.lower(), None)
                 self._authorized_app_sessions.discard(path.lower())
             con.commit()
@@ -2148,140 +2139,97 @@ foreach ($entry in $rows) {
         return 0, None
 
     def check_locked_foreground_app(self):
-        """Best-effort gate for new processes and foreground re-activations."""
-        if self._gate_active or self._folder_worker is not None or self._folder_prompt_active:
+        if self._app_scan_active:
             return
-        con = db()
-        rows = con.execute('SELECT path, display_name FROM locked_apps WHERE enabled=1').fetchall()
-        con.close()
-        locked = {str(Path(p).resolve()).lower(): n for p, n in rows}
-        locked_by_basename = {Path(p).name.casefold(): (str(Path(p).resolve()).lower(), n) for p, n in rows}
-        if not locked:
-            self._last_foreground_key = None
-            try:
-                for proc in psutil.process_iter(['pid', 'create_time']):
-                    try: self._known_processes.add((proc.info['pid'], proc.info.get('create_time')))
-                    except (psutil.NoSuchProcess, psutil.AccessDenied): pass
-            except Exception: pass
-            return
-
-        # Foreground changes (minimize/restore, switching windows, creating a document)
-        # must NOT request face auth again. Only newly launched app sessions are gated.
-        hwnd, fg_exe = self._foreground_process_path()
-        fg_key = str(Path(fg_exe).resolve()).lower() if fg_exe else None
-        if self.mode == 'login' and fg_key in locked and hwnd and os.name == 'nt':
-            try:
-                ctypes.windll.user32.ShowWindow(int(hwnd), 6)
-                self.showNormal(); self.raise_(); self.activateWindow()
-            except Exception: pass
-            return
-
-        # An authorized path remains authorized while at least one process for it is alive.
-        live_locked_paths = set()
-        live_locked_basenames = set()
+        self._app_scan_active = True
         try:
-            for proc in psutil.process_iter(['exe']):
-                try:
-                    exe = proc.info.get('exe')
-                    if exe:
-                        k = str(Path(exe).resolve()).lower()
-                        if k in locked or Path(k).name.casefold() in locked_by_basename:
-                            live_locked_paths.add(k)
-                            live_locked_basenames.add(Path(k).name.casefold())
-                except (psutil.NoSuchProcess, psutil.AccessDenied, OSError): pass
-        except Exception: pass
-        # Keep authorization for the entire app session. Newly spawned helper processes can
-        # appear a moment after the parent launch, so don't revoke it just because the first
-        # process scan briefly sees no matching executable. Clear it only after the app has
-        # been absent for a short grace period.
-        now = time.time()
-        live_authorized_keys = live_locked_paths | live_locked_basenames
-        for auth_key in list(self._authorized_app_sessions):
-            if auth_key in live_authorized_keys:
-                self._authorized_session_last_seen[auth_key] = now
-            elif now - self._authorized_session_last_seen.get(auth_key, now) > 5.0:
-                self._authorized_app_sessions.discard(auth_key)
-                self._authorized_session_last_seen.pop(auth_key, None)
+            self._scan_app_processes()
+        finally:
+            self._app_scan_active = False
 
-        # Detect newly created processes, stop them before requesting authentication.
-        now = time.time()
-        for proc in psutil.process_iter(['pid', 'exe', 'cmdline', 'create_time']):
+    def _scan_app_processes(self):
+        targets = self._app_targets
+        if not targets:
+            self._app_gate_queue.clear()
+            return
+        hwnd, fg_exe = self._foreground_process_path()
+        fg_pid = app_runtime.window_pid(hwnd, True) if hwnd else 0
+        snapshots = []
+        live = set(); live_keys = set()
+        packaged = any(app.packaged for app in targets.values())
+        normalized_paths = {app.key:{app_catalog.path_key(path) for path in app.process_paths} for app in targets.values()}
+        package_paths = set().union(*(normalized_paths[app.key] for app in targets.values() if app.packaged)) if packaged else set()
+        for proc in psutil.process_iter(['pid','exe','cmdline','create_time'], ad_value=None):
             try:
                 info = proc.info
-                identity = (info.get('pid'), info.get('create_time'))
-                if identity in self._known_processes:
-                    continue
-                self._known_processes.add(identity)
-                exe = info.get('exe')
-                if not exe:
-                    continue
-                key = str(Path(exe).resolve()).lower()
-                base_key = Path(key).name.casefold()
-                if key in self._authorized_app_sessions or base_key in self._authorized_app_sessions:
-                    continue
-                if self._authorized_launches.get(key, 0) > now:
-                    self._authorized_launches.pop(key, None)
-                    continue
-                matched_key = key if key in locked else (locked_by_basename.get(base_key, (None, None))[0])
-                if matched_key is None:
-                    continue
-                display_for_lock = locked.get(matched_key, locked_by_basename.get(base_key, (None, Path(key).stem))[1])
-                own_path = str(Path(sys.executable if getattr(sys, 'frozen', False) else sys.argv[0]).resolve()).lower()
-                if key == own_path:
-                    continue
+                pid = info['pid']; identity = (pid,info.get('create_time'))
+                live.add(identity)
+                if app_catalog.internal_pid(pid): continue
+                exe = info.get('exe') or ''
+                if not exe: continue
                 command = info.get('cmdline') or [exe]
+                if app_catalog.internal_command(command, Path(__file__).resolve()):continue
+                normalized_exe = app_catalog.path_key(exe)
+                app_id = self._app_identity_cache.get(identity,'')
+                if packaged and (identity not in self._app_identity_cache or (not app_id and pid==fg_pid)) and (identity not in self._known_processes or pid == fg_pid or normalized_exe in package_paths):
+                    app_id = app_runtime.process_app_id(pid)
+                    self._app_identity_cache[identity] = app_id
+                matches = [app for app in targets.values() if app_runtime.matches(app,exe,command,app_id,normalized_paths[app.key],normalized_exe)]
+                live_keys.update(app.key for app in matches)
+                if matches: snapshots.append((proc,info,identity,matches))
+            except (psutil.NoSuchProcess,psutil.AccessDenied,OSError): continue
+        self._app_sessions.observe(live_keys)
+        self._app_identity_cache = {key:value for key,value in self._app_identity_cache.items() if key in live}
+        pending_key = (self._pending_app_unlock or {}).get('key')
+        queued_keys = {item['key'] for item in self._app_gate_queue}
+        for proc,info,identity,matches in snapshots:
+            keys = [app.key for app in matches]
+            if self._app_sessions.allows(keys): continue
+            if pending_key in keys or queued_keys.intersection(keys): continue
+            new = identity not in self._known_processes
+            foreground = info['pid'] == fg_pid
+            if not new and not foreground: continue
+            app = matches[0]
+            request = {'key':app.key,'name':app.name,'exe':info['exe'],'pid':info['pid'],
+                       'command':None if app.packaged else (info.get('cmdline') or [info['exe']]),
+                       'hwnd':0,'cwd':app.working_directory}
+            if not new and foreground:
+                request['hwnd'] = int(hwnd)
+                app_runtime.show_window(hwnd,False)
+            else:
                 try:
+                    if proc.create_time() != identity[1]: continue
+                    try: request['cwd'] = proc.cwd()
+                    except (psutil.Error,OSError): pass
                     proc.terminate()
-                    try: proc.wait(timeout=0.8)
-                    except psutil.TimeoutExpired: proc.kill()
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error):
-                    self.status.setText(f'نتوانستم فرایند {display_for_lock} را متوقف کنم؛ مجوز تأیید نشد.')
+                except (psutil.Error,OSError):
+                    self.status.setText(f'ویندوز اجازهٔ توقف «{app.name}» را نداد؛ قفل این اجرا تأیید نشد.')
                     continue
-                if self.mode in ('enroll', 'training'):
-                    self.status.setText(f'«{display_for_lock}» هنگام ثبت چهره متوقف شد؛ پس از پایان ثبت دوباره اجرا و احراز هویت کنید.')
-                    return
-                self._begin_app_gate(matched_key, display_for_lock, command=command, exe=exe, existing=False)
-                return
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-            except Exception:
-                continue
+            if len(self._app_gate_queue) < 16:
+                self._app_gate_queue.append(request); queued_keys.add(app.key)
+        self._known_processes = live
+        if (self._app_gate_queue and self.mode == 'idle' and self._pending_app_unlock is None
+                and self._folder_worker is None and not self._folder_prompt_active
+                and QApplication.activeModalWidget() is None):
+            self._begin_app_gate_request(self._app_gate_queue.popleft())
 
-    def _begin_app_gate(self, key, display_name, hwnd=0, command=None, exe=None, existing=False):
-        if self.mode in ('enroll', 'login', 'training'):
+    def _begin_app_gate_request(self, pending):
+        if pending['key'] not in self._app_targets:
             return
-        if existing and hwnd and os.name == 'nt':
-            try: ctypes.windll.user32.ShowWindow(int(hwnd), 6)  # SW_MINIMIZE
-            except Exception: pass
-        self._gate_active = True
-        try:
-            self.showNormal(); self.raise_(); self.activateWindow()
-            self._pending_app_unlock = {'key': key, 'name': display_name,
-                'command': command or [exe], 'exe': exe or key,
-                'hwnd': int(hwnd or 0) if existing else 0}
-            con = db()
-            row = con.execute('SELECT id FROM users ORDER BY id LIMIT 1').fetchone()
-            con.close()
-            if not row or not self.face_templates and (not TEMPLATE_PATH.exists() or self.face_template is None):
-                self.status.setText(f'مجوز «{display_name}» داده نشد؛ ابتدا چهره را ثبت کنید.')
-                QMessageBox.warning(self, 'مجوز اجرا داده نشد', f'«{display_name}» قفل ماند. ابتدا چهره را در FaceGate ثبت کنید.')
-                self.stop_camera()
-                self._pending_app_unlock = None
-                return
-            self.login_user_id = int(row[0])
-            if not self.start_camera():
-                self.status.setText(f'وب‌کم در دسترس نیست؛ «{display_name}» قفل ماند.')
-                QMessageBox.warning(self, 'وب‌کم در دسترس نیست', f'برای باز کردن «{display_name}» دوربین لازم است. برنامه قفل ماند.')
-                self._pending_app_unlock = None
-                self.mode = 'idle'
-                return
-            self.login_start = time.time()
-            self.login_matches = 0
-            self.login_last_label = None
-            self.mode = 'login'
-            self.status.setText(f'مجوز «{display_name}» هنوز داده نشده؛ چهره را روبه‌روی دوربین نگه دارید…')
-        finally:
-            self._gate_active = False
+        self._pending_app_unlock = pending
+        self._restore_from_tray()
+        self.set_workspace_mode('apps')
+        if self.face_template is None or self.recognizer is None:
+            self.stop_camera(); self.mode = 'idle'
+            self.status.setText('چهره آماده نیست؛ برای برنامهٔ در انتظار از رمز پشتیبان استفاده کن.')
+            return
+        if not self.start_camera():
+            self.mode = 'idle'
+            self.status.setText('دوربین در دسترس نیست؛ برنامه در انتظار رمز پشتیبان است.')
+            return
+        self.login_start = time.time(); self.login_matches = 0; self.login_last_label = None
+        self.mode = 'login'
+        self.status.setText(f'برای بازکردن «{pending["name"]}» چهره را روبه‌روی دوربین نگه دار…')
 
     def start_camera(self):
         """Open the webcam only for an explicit authentication/enrollment session."""
