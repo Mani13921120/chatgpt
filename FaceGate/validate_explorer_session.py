@@ -28,6 +28,8 @@ def main():
     if os.name != 'nt':
         raise SystemExit('Requires a real interactive Windows desktop and NTFS.')
     import pythoncom
+    import pywintypes
+    import win32file
     import win32com.client
     pythoncom.CoInitialize()
     try:
@@ -71,8 +73,10 @@ def main():
                     crypto.lock_folder_in_place(root, base / 'metadata', manifest=manifest)
                     crypto.folder_gate.release(root)  # Verify durable ACL rather than sharing handles.
                     try:
-                        file.read_bytes()
-                    except OSError as denied:
+                        handle = win32file.CreateFile(str(file), crypto.folder_gate.FILE_READ_DATA,
+                                                      crypto.folder_gate.FILE_SHARE_ALL, None, 3, 0x02000000, None)
+                        handle.Close()
+                    except pywintypes.error as denied:
                         assert denied.winerror == 5, repr(denied)
                     else:
                         raise AssertionError('Locked contents are still readable')

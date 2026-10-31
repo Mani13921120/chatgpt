@@ -102,10 +102,19 @@ class WindowsCommandTests(unittest.TestCase):
         # Persian or any other language. Closing live handles isolates the ACL.
         gate.engage(self.root, self.manifest)
         gate.release(self.root)
-        for operation in (self.file.read_bytes, lambda: list(self.root.iterdir())):
-            with self.assertRaises(OSError) as denied:
-                operation()
+        import pywintypes
+        import win32file
+        for path in (self.file, self.root):
+            # CPython's CRT-backed open() maps this to errno.EACCES and can
+            # discard winerror. Query the native CreateFile result directly.
+            with self.assertRaises(pywintypes.error) as denied:
+                handle = win32file.CreateFile(str(path), gate.FILE_READ_DATA, gate.FILE_SHARE_ALL,
+                                              None, 3, 0x02000000, None)
+                handle.Close()
             self.assertEqual(denied.exception.winerror, 5, str(denied.exception))
+        for operation in (self.file.read_bytes, lambda: list(self.root.iterdir())):
+            with self.assertRaises(PermissionError):
+                operation()
         gate.disengage(self.root, self.manifest)
         self.assertEqual(self.file.read_bytes(), b'FaceGate command test payload')
         self.assertIn(self.file.parent, list(self.root.iterdir()))
