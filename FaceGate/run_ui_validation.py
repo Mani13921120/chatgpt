@@ -4,9 +4,30 @@ import faulthandler
 import os
 from pathlib import Path
 import sys
+import subprocess
 import unittest
 import traceback
 from run_windows_validation import annotation
+
+if '--worker' not in sys.argv[1:]:
+    # A native Qt abort cannot be caught by unittest. Keep a small supervising
+    # process so its actual stderr/progress becomes a useful CI annotation.
+    try:
+        completed = subprocess.run([sys.executable, '-u', str(Path(__file__).resolve()), '--worker'],
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, encoding='utf-8', errors='replace', timeout=120)
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or b''
+        if isinstance(output, bytes):
+            output = output.decode('utf-8', errors='replace')
+        print(output, flush=True)
+        print('::error title=Qt validation timeout::' + annotation(output[-8000:]), flush=True)
+        raise SystemExit(1)
+    print(completed.stdout, flush=True)
+    if completed.returncode:
+        print('::error title=Qt validation process exit ' + str(completed.returncode) + '::'
+              + annotation(completed.stdout[-8000:]), flush=True)
+    raise SystemExit(completed.returncode)
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 if hasattr(sys.stdout, 'reconfigure'):
