@@ -36,4 +36,5 @@ class SessionSetupTests(unittest.TestCase):
             database = Path(d) / 'users.db'
             with sqlite3.connect(database) as con:
                 con.execute('CREATE TABLE guardian_pending (key TEXT)')
+            con.close()  # sqlite3's transaction context does not close the handle.
             self.assertIsNone(find_protected_root(r'C:\Ordinary', database))
