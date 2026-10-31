@@ -11,6 +11,7 @@ import uuid
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 from PySide6.QtTest import QTest
+from PySide6.QtCore import QEventLoop, QTimer, QThread
 from PySide6.QtWidgets import QApplication, QMessageBox
 from instance_bridge import InstanceServer, forward_request
 
@@ -65,6 +66,8 @@ class FolderUiTests(unittest.TestCase):
     def tearDown(self):
         self.win.cancel_action()
         self.win._stop_explorer_observation()
+        if self.win._folder_worker is not None:
+            self._wait_for_folder_worker()
         self.win._explorer_sessions.sessions.clear()
         self.win._instance_request_timer.stop()
         self.win._queued_shell_requests.clear()
@@ -74,6 +77,26 @@ class FolderUiTests(unittest.TestCase):
         for p in reversed(self.patches):
             p.stop()
         self.temp.cleanup()
+
+    def _wait_for_folder_worker(self):
+        worker = self.win._folder_worker
+        if worker is None:
+            return
+        loop = QEventLoop()
+        deadline = QTimer()
+        deadline.setSingleShot(True)
+        deadline.timeout.connect(loop.quit)
+        worker.finished.connect(loop.quit)
+        progress = QTimer()
+        progress.timeout.connect(lambda: loop.quit() if self.win._folder_worker is None else None)
+        progress.start(10)
+        deadline.start(10000)
+        # Enter a real Qt event loop. Repeated QTest.qWait calls can starve a
+        # Python QThread of the GIL on Windows/Python 3.13.
+        loop.exec()
+        deadline.stop()
+        progress.stop()
+        self.assertIsNone(self.win._folder_worker, 'Real folder worker did not finish')
 
     def _start_camera(self):
         self.win.cap = self.camera
@@ -161,6 +184,15 @@ class FolderUiTests(unittest.TestCase):
         self.assertTrue(self.win._folder_session_timer.isActive())
         self.assertFalse(self.win.isVisible())
 
+    def test_folder_completion_runs_on_gui_thread_only_after_worker_finishes(self):
+        calls = []
+        def complete(ok, value):
+            calls.append((QThread.currentThread() == APP.thread(), worker.isFinished(), ok, value))
+        self.win._run_folder_worker(lambda: 7, complete, 'worker lifecycle regression')
+        worker = self.win._folder_worker
+        self._wait_for_folder_worker()
+        self.assertEqual(calls, [(True, True, True, 7)])
+
     def test_double_click_child_with_live_session_reuses_access_to_correct_child(self):
         child = self.root / 'child'; child.mkdir()
         self.win._explorer_sessions.begin(str(self.root))
@@ -214,9 +246,7 @@ class FolderUiTests(unittest.TestCase):
              patch.object(crypto.folder_gate, 'engage') as engage, \
              patch.object(QMessageBox, 'warning'):
             self.win._explorer_probe_done(probe)
-            deadline = __import__('time').monotonic() + 10
-            while self.win._folder_worker is not None and __import__('time').monotonic() < deadline:
-                QTest.qWait(20)
+            self._wait_for_folder_worker()
         self.assertIsNone(self.win._folder_worker, 'Real folder worker did not finish')
         engage.assert_called_once()
         self.assertTrue(self.win._folder_record(str(self.root))['locked'])

@@ -9,6 +9,9 @@ import unittest
 import traceback
 from run_windows_validation import annotation
 
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='backslashreplace')
+
 if '--worker' not in sys.argv[1:]:
     # A native Qt abort cannot be caught by unittest. Keep a small supervising
     # process so its actual stderr/progress becomes a useful CI annotation.
@@ -30,8 +33,6 @@ if '--worker' not in sys.argv[1:]:
     raise SystemExit(completed.returncode)
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
-if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8', errors='backslashreplace')
 suite = unittest.defaultTestLoader.loadTestsFromNames(['test_folder_ui', 'test_shell_integration', 'test_session_setup', 'test_explorer_sessions'])
 faulthandler.enable()
 

@@ -56,7 +56,7 @@ from instance_bridge import InstanceServer, forward_request, instance_name
 from ctypes import wintypes
 import cv2
 import numpy as np
-from PySide6.QtCore import QTimer, Qt, QThread, Signal, QFileInfo, QSize
+from PySide6.QtCore import QTimer, Qt, QThread, Signal, Slot, QFileInfo, QSize
 from PySide6.QtGui import QImage, QPixmap, QAction
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton,
     QLineEdit, QVBoxLayout, QHBoxLayout, QGridLayout, QMessageBox, QFrame, QInputDialog, QFileDialog, QListWidget, QListWidgetItem, QSystemTrayIcon, QMenu, QStyle, QScrollArea, QDialog, QDialogButtonBox, QAbstractItemView, QComboBox, QFileIconProvider)
@@ -159,17 +159,18 @@ def normalize_embedding(feature):
 
 class FolderOperationWorker(QThread):
     """Run potentially long folder crypto operations away from the GUI thread."""
-    result_ready = Signal(bool, object)
-
     def __init__(self, task, parent=None):
         super().__init__(parent)
         self.task = task
+        self.succeeded = False
+        self.result = None
 
     def run(self):
         try:
-            self.result_ready.emit(True, self.task())
+            self.result = self.task()
+            self.succeeded = True
         except Exception as exc:
-            self.result_ready.emit(False, {"error": str(exc), "traceback": traceback.format_exc()})
+            self.result = {"error": str(exc), "traceback": traceback.format_exc()}
 
 
 class FaceTrainingWorker(QThread):
@@ -752,7 +753,7 @@ class FaceGate(QMainWindow):
     def refresh_protected_folders(self):
         if not hasattr(self, 'protected_folder_list'):
             return
-        if self._folder_worker is not None and self._folder_worker.isRunning():
+        if self._folder_worker is not None:
             self.status.setText('عملیات پوشه هنوز در حال اجراست؛ پس از اتمام، فهرست را تازه کن.')
             return
         self._sync_orphaned_folder_manifests()
@@ -1115,9 +1116,20 @@ foreach ($entry in $rows) {
         worker = FolderOperationWorker(task, self)
         self._folder_worker = worker
         self._folder_worker_callback = callback
-        worker.result_ready.connect(lambda ok, result, w=worker: self._folder_worker_done(w, ok, result))
+        # A QObject-bound slot is disconnected if the window is destroyed;
+        # a Python lambda can otherwise call into a deleted native Qt widget.
+        worker.finished.connect(self._folder_worker_finished)
         worker.start()
         return True
+
+    @Slot()
+    def _folder_worker_finished(self):
+        worker = self.sender()
+        if worker is None:
+            return
+        worker.wait()
+        self._folder_worker_done(worker, worker.succeeded, worker.result)
+        worker.deleteLater()
 
     def _folder_worker_done(self, worker, ok, result):
         if self._folder_worker is not worker:
@@ -1339,8 +1351,15 @@ foreach ($entry in $rows) {
             return
         worker = ExplorerProbeWorker(self._explorer_sessions.tokens(), self)
         self._explorer_probe = worker
-        worker.finished.connect(lambda w=worker: self._explorer_probe_done(w))
+        worker.finished.connect(self._explorer_probe_finished)
         worker.start()
+
+    @Slot()
+    def _explorer_probe_finished(self):
+        worker = self.sender()
+        if worker is not None:
+            worker.wait()
+            self._explorer_probe_done(worker)
 
     def _explorer_probe_done(self, worker):
         if self._explorer_probe is not worker:
@@ -1410,7 +1429,11 @@ foreach ($entry in $rows) {
         self._folder_session_timer.stop()
         if self._explorer_probe is not None:
             # snapshot() terminates its own probe subprocess after four seconds.
-            self._explorer_probe.wait()
+            worker = self._explorer_probe
+            self._explorer_probe = None
+            worker.finished.disconnect(self._explorer_probe_finished)
+            worker.wait()
+            worker.deleteLater()
 
     def set_folder_pin(self):
         QMessageBox.information(self, 'PIN پوشه', 'PIN هشت‌رقمی هنگام رمزگذاری هر پوشه تنظیم می‌شود. برای تغییر آن، پوشه را با PIN فعلی باز کن و دوباره محافظت کن.')
