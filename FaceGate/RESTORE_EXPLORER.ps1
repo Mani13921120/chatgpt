@@ -16,6 +16,10 @@ try {
         } finally { if ($null -ne $state) { $state.Dispose() } }
     }
 } finally { if ($null -ne $key) { $key.Dispose() } }
+$state = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($statePath, $true)
+try {
+    if ($null -ne $state) { $state.DeleteValue('DoubleClickEnabled', $false) }
+} finally { if ($null -ne $state) { $state.Dispose() } }
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;

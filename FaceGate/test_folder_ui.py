@@ -64,6 +64,8 @@ class FolderUiTests(unittest.TestCase):
 
     def tearDown(self):
         self.win.cancel_action()
+        self.win._stop_explorer_observation()
+        self.win._explorer_sessions.sessions.clear()
         self.win._instance_request_timer.stop()
         self.win._queued_shell_requests.clear()
         self.win.close()
@@ -138,6 +140,129 @@ class FolderUiTests(unittest.TestCase):
         self.assertIsNone(self.win.cap)
         self.assertFalse(self.win._folder_auth_timer.isActive())
         self.assertIsNone(self.win._pending_app_unlock)
+
+    def test_double_click_does_not_launch_explorer_before_authentication(self):
+        with patch.object(self.win, 'start_camera', self._start_camera), \
+             patch.object(self.main.explorer_integration, 'open_directory') as open_directory:
+            self.win._handle_instance_request({'action': 'open-face', 'path': str(self.root)})
+        open_directory.assert_not_called()
+        self.assertEqual(self.win.mode, 'login')
+        self.assertTrue(self.win._folder_open_from_shell)
+        self.assertTrue(self.win._folder_record(str(self.root))['locked'])
+
+    def test_authenticated_open_starts_observation_before_launching_explorer(self):
+        def opened(path):
+            self.assertIn(self.main.explorer_sessions.path_key(path), self.win._explorer_sessions.tokens())
+            self.assertFalse(self.win._folder_record(path)['locked'])
+        with patch.object(self.main.explorer_integration, 'open_directory', side_effect=opened) as launch:
+            self.win._folder_open_from_shell = True
+            self.win._on_folder_unlock_done(self.record, True, {})
+        launch.assert_called_once()
+        self.assertTrue(self.win._folder_session_timer.isActive())
+        self.assertFalse(self.win.isVisible())
+
+    def test_double_click_child_with_live_session_reuses_access_to_correct_child(self):
+        child = self.root / 'child'; child.mkdir()
+        self.win._explorer_sessions.begin(str(self.root))
+        self.win._explorer_sessions.observe([str(self.root)], self.win._explorer_sessions.tokens())
+        with patch.object(self.main.explorer_integration, 'open_directory') as launch, \
+             patch.object(self.win, '_start_folder_face_auth') as authenticate:
+            self.win._handle_instance_request({'action': 'open-face', 'path': str(child)})
+        launch.assert_called_once_with(str(child))
+        authenticate.assert_not_called()
+
+    def test_double_click_child_without_session_authenticates_root_and_preserves_destination(self):
+        child = self.root / 'child'; child.mkdir()
+        with patch.object(self.win, '_start_folder_face_auth') as authenticate, \
+             patch.object(self.main.explorer_integration, 'open_directory') as launch:
+            self.win._handle_instance_request({'action': 'open-face', 'path': str(child)})
+        authenticate.assert_called_once()
+        self.assertEqual(authenticate.call_args.args[0]['path'], str(self.root))
+        self.assertEqual(self.win._folder_open_target, str(child))
+        launch.assert_not_called()
+
+    def test_successful_child_authentication_opens_child_and_observes_its_root(self):
+        child = self.root / 'child'; child.mkdir()
+        self.win._folder_open_target = str(child)
+        with patch.object(self.main.explorer_integration, 'open_directory') as launch:
+            self.win._on_folder_unlock_done(self.record, True, {})
+        launch.assert_called_once_with(str(child))
+        self.assertIn(self.main.explorer_sessions.path_key(str(self.root)), self.win._explorer_sessions.tokens())
+
+    def test_failed_child_explorer_launch_relocks_its_registered_root(self):
+        child = self.root / 'child'; child.mkdir()
+        with patch.object(self.main.explorer_integration, 'open_directory', side_effect=OSError('Explorer failed')), \
+             patch.object(QMessageBox, 'warning'), \
+             patch.object(self.win, '_automatic_relock') as relock:
+            self.win._open_folder_in_explorer(str(child))
+        relock.assert_called_once_with(str(self.root))
+
+    def test_automatic_relock_encrypts_changed_files_and_marks_database_only_on_success(self):
+        crypto = self.main.inplace_crypto
+        key = b'k' * 32
+        crypto.write_manifest(self.root, self.win._metadata_root(), {'test': True}, '', 'unlocked')
+        con = self.main.db()
+        con.execute('UPDATE protected_folders SET is_locked=0'); con.commit(); con.close()
+        (self.root / 'sample.txt').write_text('edited while Explorer was open')
+        self.win._explorer_sessions.begin(str(self.root), now=0)
+        probe = Mock(paths=[], tokens=self.win._explorer_sessions.tokens(), error='')
+        self.win._explorer_probe = probe
+        # Exercise the real background transform, manifest and SQLite callbacks;
+        # only Windows ACL bindings and DPAPI are replaced in this Linux test.
+        with patch.object(crypto, 'unwrap_key', return_value=key), \
+             patch.object(crypto.folder_gate, '_api'), \
+             patch.object(crypto.folder_gate, 'engage') as engage, \
+             patch.object(QMessageBox, 'warning'):
+            self.win._explorer_probe_done(probe)
+            deadline = __import__('time').monotonic() + 10
+            while self.win._folder_worker is not None and __import__('time').monotonic() < deadline:
+                QTest.qWait(20)
+        self.assertIsNone(self.win._folder_worker, 'Real folder worker did not finish')
+        engage.assert_called_once()
+        self.assertTrue(self.win._folder_record(str(self.root))['locked'])
+        self.assertFalse(self.win._explorer_sessions.sessions)
+        self.assertEqual(crypto.read_manifest(self.mp)['state'], 'locked')
+        self.assertTrue(crypto.is_encrypted_file(self.root / 'sample.txt'))
+        crypto.decrypt_file_in_place(self.root / 'sample.txt', key)
+        self.assertEqual((self.root / 'sample.txt').read_text(), 'edited while Explorer was open')
+
+    def test_failed_automatic_relock_keeps_session_and_unlocked_database_for_retry(self):
+        con = self.main.db()
+        con.execute('UPDATE protected_folders SET is_locked=0'); con.commit(); con.close()
+        self.win._explorer_sessions.begin(str(self.root))
+        with patch.object(self.win, '_run_folder_worker', self._run_sync), \
+             patch.object(self.main.inplace_crypto, 'lock_folder_in_place', side_effect=PermissionError('file is busy')), \
+             patch.object(QMessageBox, 'warning') as warning:
+            self.win._automatic_relock(str(self.root))
+            self.win._automatic_relock(str(self.root))
+        warning.assert_called_once()
+        self.assertFalse(self.win._folder_record(str(self.root))['locked'])
+        self.assertTrue(self.win._explorer_sessions.sessions)
+        self.assertEqual((self.root / 'sample.txt').read_text(), 'original')
+
+    def test_closing_window_keeps_watcher_alive_until_folder_is_relocked(self):
+        self.win._request_only = True
+        self.win._explorer_sessions.begin(str(self.root))
+        with patch.object(self.win._guardian_timer, 'stop') as stop, \
+             patch.object(self.main.QTimer, 'singleShot') as schedule:
+            self.win.show()
+            self.win.close()
+        self.assertFalse(self.win.isVisible())
+        self.assertTrue(self.win._explorer_sessions.sessions)
+        stop.assert_not_called()
+        schedule.assert_not_called()
+
+    def test_app_authentication_cannot_quit_while_a_folder_session_is_open(self):
+        self.win._request_only = True
+        self.win._explorer_sessions.begin(str(self.root))
+        app = self.main.app_catalog.App.desktop(str(self.root / 'selected.exe'))
+        self.win._app_targets = {app.key: app}
+        pending = {'key': app.key, 'name': app.name, 'pid': 123, 'hwnd': 0, 'command': [app.executable]}
+        with patch.object(self.win, '_publish_gui_state'), \
+             patch.object(self.main.app_runtime, 'launch'), \
+             patch.object(self.main.QTimer, 'singleShot') as schedule:
+            self.win._launch_pending_app(pending)
+        schedule.assert_not_called()
 
     def test_missing_camera_offers_pin_without_releasing_folder(self):
         def choose_pin(box):
@@ -247,6 +372,23 @@ class FolderUiTests(unittest.TestCase):
             self.win._begin_app_gate_request(pending)
         self.assertIs(self.win._pending_app_unlock, pending)
         self.assertFalse(self.win._app_sessions.allows([app.key]))
+
+    def test_request_only_success_exits_but_manual_window_does_not(self):
+        app = self.main.app_catalog.App.desktop(str(self.root / 'selected.exe'))
+        self.win._app_targets = {app.key: app}
+        pending = {'key': app.key, 'name': app.name, 'pid': 123, 'hwnd': 0, 'command': [app.executable]}
+        for temporary in (False, True):
+            self.win._request_only = temporary
+            self.win._pending_app_unlock = pending
+            with patch.object(self.win, '_publish_gui_state'), \
+                 patch.object(self.main.app_runtime, 'launch') as launch, \
+                 patch.object(self.main.QTimer, 'singleShot') as schedule:
+                self.win._launch_pending_app(pending)
+            launch.assert_called_once()
+            self.assertEqual(schedule.call_count, int(temporary))
+            if temporary:
+                self.assertEqual(schedule.call_args.args[1], APP.quit)
+            self.assertTrue(self.win._app_sessions.allows([app.key]))
 
     def test_failed_app_launch_revokes_authentication_and_stops_camera(self):
         app = self.main.app_catalog.App.desktop(str(self.root / 'selected.exe'))

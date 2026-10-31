@@ -12,6 +12,8 @@ def find_protected_root(folder, database):
         return None
     # Read-only: opening an ordinary folder must not create a DB or test folder.
     with closing(sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True)) as con:
+        if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='protected_folders'").fetchone():
+            return None
         rows = con.execute('SELECT path FROM protected_folders').fetchall()
     def canonical(path):
         return ntpath.normcase(os.path.realpath(path) if os.name == 'nt' else ntpath.abspath(path))

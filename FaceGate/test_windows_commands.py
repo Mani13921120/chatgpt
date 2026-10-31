@@ -97,6 +97,40 @@ class WindowsCommandTests(unittest.TestCase):
     def test_powershell_copy_known_file_stays_denied_after_process_handles_close(self):
         self.assert_copy_blocked('powershell', "Copy-Item -LiteralPath (Join-Path $env:FG_SOURCE 'nested\\data.txt') -Destination $env:FG_TARGET -Force", persistent=True)
 
+    def test_persistent_acl_returns_native_access_denied_for_direct_read_and_listing(self):
+        # Check the native error number, not an English string: Windows can be
+        # Persian or any other language. Closing live handles isolates the ACL.
+        gate.engage(self.root, self.manifest)
+        gate.release(self.root)
+        for operation in (self.file.read_bytes, lambda: list(self.root.iterdir())):
+            with self.assertRaises(OSError) as denied:
+                operation()
+            self.assertEqual(denied.exception.winerror, 5, str(denied.exception))
+        gate.disengage(self.root, self.manifest)
+        self.assertEqual(self.file.read_bytes(), b'FaceGate command test payload')
+        self.assertIn(self.file.parent, list(self.root.iterdir()))
+
+    def assert_rename_blocked(self, kind, command):
+        renamed = self.base / 'renamed folder'
+        positive = self.command(kind, command, renamed)
+        self.assertEqual(positive.returncode, 0, (positive.stdout, positive.stderr))
+        self.assertTrue(renamed.is_dir(), 'Rename positive control did not run')
+        renamed.rename(self.root)
+        gate.engage(self.root, self.manifest)
+        gate.release(self.root)
+        negative = self.command(kind, command, renamed)
+        self.assertNotEqual(negative.returncode, 0, (negative.stdout, negative.stderr))
+        self.assertTrue(self.root.is_dir())
+        self.assertFalse(renamed.exists())
+        gate.disengage(self.root, self.manifest)
+        self.assertEqual(self.file.read_bytes(), b'FaceGate command test payload')
+
+    def test_cmd_rename_is_denied_while_locked(self):
+        self.assert_rename_blocked('cmd', 'ren "%FG_SOURCE%" "renamed folder"')
+
+    def test_powershell_rename_is_denied_while_locked(self):
+        self.assert_rename_blocked('powershell', "Rename-Item -LiteralPath $env:FG_SOURCE -NewName 'renamed folder'")
+
     def assert_delete_blocked(self, kind, command, persistent=False):
         gate.engage(self.root, self.manifest)
         if persistent:

@@ -68,6 +68,7 @@ def restore_legacy_default(registry=None):
 def install(command, icon, registry=None):
     reg = registry or _registry()
     restore_legacy_default(reg)
+    _delete_value(reg, STATE_KEY, 'DoubleClickEnabled')
     verb_key = SHELL_KEY + '\\' + VERB
     _write(reg, verb_key, None, 'بازکردن با FaceGate', reg.REG_SZ)
     _write(reg, verb_key, 'Icon', icon, reg.REG_SZ)
@@ -77,6 +78,24 @@ def install(command, icon, registry=None):
         _notify_shell()
 
 
+def install_double_click(command, icon, registry=None):
+    """Opt-in routing; preserve the prior default for explicit recovery."""
+    reg = registry or _registry()
+    install(command, icon, reg)
+    previous = _read(reg, SHELL_KEY)
+    _write(reg, STATE_KEY, 'PreviousDefault', json.dumps(previous), reg.REG_SZ)
+    _write(reg, STATE_KEY, 'DoubleClickEnabled', '1', reg.REG_SZ)
+    _write(reg, SHELL_KEY, None, VERB, reg.REG_SZ)
+    if registry is None:
+        _notify_shell()
+
+
+def double_click_enabled(registry=None):
+    reg = registry or _registry()
+    value = _read(reg, STATE_KEY, 'DoubleClickEnabled')
+    return bool(value and value[0] == '1')
+
+
 def uninstall(registry=None):
     reg = registry or _registry()
     restore_legacy_default(reg)
@@ -84,6 +103,7 @@ def uninstall(registry=None):
     _delete_key(reg, SHELL_KEY + '\\' + VERB + r'\command')
     _delete_key(reg, SHELL_KEY + '\\' + VERB)
     _delete_value(reg, STATE_KEY, 'PreviousDefault')
+    _delete_value(reg, STATE_KEY, 'DoubleClickEnabled')
     _delete_key(reg, STATE_KEY)
     if registry is None:
         _notify_shell()

@@ -9,7 +9,7 @@ from run_windows_validation import annotation
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', errors='backslashreplace')
-suite = unittest.defaultTestLoader.loadTestsFromNames(['test_folder_ui', 'test_shell_integration'])
+suite = unittest.defaultTestLoader.loadTestsFromNames(['test_folder_ui', 'test_shell_integration', 'test_session_setup', 'test_explorer_sessions'])
 stream = io.StringIO()
 result = unittest.TextTestRunner(stream=stream, verbosity=2).run(suite)
 print(stream.getvalue())
